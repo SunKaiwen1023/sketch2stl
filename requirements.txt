@@ -1,0 +1,19 @@
+# --- core geometry --------------------------------------------------------- #
+numpy>=1.26
+shapely>=2.0            # 2-D polygon cleanup and booleans
+trimesh>=4.0            # extrusion, 3-D booleans, STL/GLB export
+manifold3d>=2.3         # the boolean engine trimesh uses; without it CUT fails
+
+# --- UI -------------------------------------------------------------------- #
+gradio>=4.44
+
+# --- recognition ----------------------------------------------------------- #
+scikit-learn>=1.4       # least-squares fits, and the classical ML arm
+scikit-image>=0.22      # skeletonisation, if you take option (a) for the canvas
+
+# --- dev ------------------------------------------------------------------- #
+pytest>=8.0
+
+# Add autogluon.tabular here ONLY if you take the AutoGluon route for the ML
+# arm. It is a large install and it will slow the HF Space build considerably,
+# so train locally, commit the model, and load it at runtime instead.

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Never commit generated geometry
+*.stl
+*.glb
+*.obj
+*.3mf
+!tests/fixtures/*.stl
+
+# Never commit model weights or datasets
+models/
+data/**
+!data/.gitkeep
+!data/README.md
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Gradio
+gradio_cached_examples/
+flagged/
