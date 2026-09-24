@@ -36,7 +36,7 @@ domain-gap section of the report writes itself in the wrong direction.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -66,7 +66,50 @@ TYPICAL = HandStyle()
 SHAKY = HandStyle(tremor_mm=0.9, speed_warp=0.6, overshoot_mm=2.5,
                   corner_round_mm=1.6, slant_deg=3.0, scale_jitter=0.05)
 
-STYLES = {"neat": NEAT, "typical": TYPICAL, "shaky": SHAKY}
+# Calibrated against PK's 325 real mouse-drawn strokes, 2026-09-24.
+# Measured: real circles fit with a median radial residual of 2.38 mm. TYPICAL
+# produced 0.30 mm - SEVEN TIMES too clean. A model trained on TYPICAL has never
+# seen a stroke as rough as the ones it meets in the app, which is most of why
+# the synthetic-to-real transfer was poor. Derive this with scripts/calibrate.py.
+MOUSE = HandStyle(tremor_mm=2.5, tremor_smooth=7, speed_warp=0.45,
+                  overshoot_mm=2.0, corner_round_mm=1.2, slant_deg=2.5,
+                  scale_jitter=0.04)
+
+STYLES = {"neat": NEAT, "typical": TYPICAL, "shaky": SHAKY, "mouse": MOUSE}
+
+
+# --------------------------------------------------------------------------- #
+# A real hand is not uniformly shaky, and that turned out to matter a lot.
+#
+# Measured on PK's 325 real mouse strokes:
+#
+#     real lines    median line-fit residual    0.28 mm   drawn fast, confident
+#     real arcs     median circle-fit residual  1.24 mm
+#     real circles  median circle-fit residual  2.38 mm   drawn slow, error piles up
+#
+# An 8x spread between the steadiest and shakiest shape. Applying one tremor_mm
+# to all of them - which is what `--style mouse` did at first - makes synthetic
+# lines 1.62 mm rough when real ones are 0.28. Every synthetic line then blows
+# past LINE_RESIDUAL_MM and the rules arm scored F1 0.000 on lines.
+#
+# line/arc/circle below are measured. rect and polyline are interpolated: a
+# rectangle is four confident strokes so it sits near arcs, and a polyline is
+# whatever was left over. Re-derive with scripts/calibrate.py.
+# --------------------------------------------------------------------------- #
+TREMOR_BY_KIND = {
+    "line":     0.45,   # measured
+    "arc":      2.00,   # measured
+    "circle":   4.00,   # measured
+    "rect":     1.50,   # interpolated
+    "polyline": 3.00,   # interpolated
+}
+
+
+def style_for(kind, base: HandStyle = MOUSE) -> HandStyle:
+    """The drawing style for one shape class. Falls back to `base` if unknown."""
+    key = getattr(kind, "value", str(kind))
+    tremor = TREMOR_BY_KIND.get(key)
+    return base if tremor is None else replace(base, tremor_mm=tremor)
 
 
 def _smooth(x: np.ndarray, window: int) -> np.ndarray:

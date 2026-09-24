@@ -43,7 +43,7 @@ from sketch2stl.config import RESAMPLE_N                                   # noq
 from sketch2stl.data.fusion360 import (curves_from_model, iter_models,     # noqa: E402
                                        load_split, operations_from_model)
 from sketch2stl.data.synth import (STYLES, deviation, handdraw,  # noqa: E402
-                                   to_canvas_scale)              # noqa: E402
+                                   style_for, to_canvas_scale)              # noqa: E402
 from sketch2stl.strokes import prepare_points, resample                    # noqa: E402
 from sketch2stl.types import PrimitiveKind                                 # noqa: E402
 
@@ -108,14 +108,17 @@ def _polyline_from_curves(curves, rng) -> np.ndarray | None:
     return np.vstack([out, out[:1]])
 
 
-def _draw(clean, style, rng, rescale=True, closed=None):
+def _draw(clean, style, rng, rescale=True, closed=None, kind=None):
     """Rescale to canvas size, then distort. Returns (stroke, clean_at_canvas_scale).
 
     The deviation must be measured against the RESCALED curve, not the original -
     otherwise it reports the rescaling, not the hand.
     """
     base = to_canvas_scale(clean, rng) if rescale else np.asarray(clean, dtype=np.float64)
-    return handdraw(base, style, rng, closed=closed), base
+    # Shape-dependent shakiness: a real hand draws lines straight and circles
+    # wobbly, an 8x spread. See TREMOR_BY_KIND in data/synth.py.
+    st = style_for(kind, style) if kind is not None else style
+    return handdraw(base, st, rng, closed=closed), base
 
 
 def collect(root, model_ids, per_class, style, rng, max_models=None, rescale=True):
@@ -137,7 +140,7 @@ def collect(root, model_ids, per_class, style, rng, max_models=None, rescale=Tru
         for c in curves:
             if c.kind not in CAD_CLASSES or quota[c.kind] >= per_class:
                 continue
-            stroke, base = _draw(c.points, style, rng, rescale)
+            stroke, base = _draw(c.points, style, rng, rescale, kind=c.kind)
             strokes.append(prepare_points(stroke))
             labels.append(c.kind.value)
             owners.append(model_id)
@@ -148,7 +151,8 @@ def collect(root, model_ids, per_class, style, rng, max_models=None, rescale=Tru
         if quota[PrimitiveKind.RECT] < per_class:
             ring = _rect_from_lines(curves, rng)
             if ring is not None:
-                stroke, base = _draw(ring, style, rng, rescale, closed=True)
+                stroke, base = _draw(ring, style, rng, rescale, closed=True,
+                                     kind=PrimitiveKind.RECT)
                 strokes.append(prepare_points(stroke))
                 labels.append(PrimitiveKind.RECT.value)
                 owners.append(model_id)
@@ -158,7 +162,8 @@ def collect(root, model_ids, per_class, style, rng, max_models=None, rescale=Tru
         if quota[PrimitiveKind.POLYLINE] < per_class:
             blob = _polyline_from_curves(curves, rng)
             if blob is not None:
-                stroke, base = _draw(blob, style, rng, rescale, closed=True)
+                stroke, base = _draw(blob, style, rng, rescale, closed=True,
+                                     kind=PrimitiveKind.POLYLINE)
                 strokes.append(prepare_points(stroke))
                 labels.append(PrimitiveKind.POLYLINE.value)
                 owners.append(model_id)
@@ -233,9 +238,9 @@ def main() -> None:
         print(f"  per class: {counts}")
         print(f"  mean deviation from the clean curve: {dev.mean():.2f} mm "
               f"(sd {dev.std():.2f}, max {dev.max():.2f})")
-        if dev.mean() > 1.5:
-            print("  !! that is high for a hand. Expect 0.3-0.8 mm. Check --no-rescale "
-                  "is not set, or lower HandStyle.tremor_mm in sketch2stl/data/synth.py.")
+        if dev.mean() > 4.0:
+            print("  !! that is high even for a mouse. Check --no-rescale is not set, "
+                  "or re-run scripts/calibrate.py against real strokes.")
         meta[name] = {"n": int(len(X)), "n_models": n_models, "per_class": counts,
                       "mean_deviation_mm": float(dev.mean())}
         if name == "train" and ops:

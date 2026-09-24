@@ -19,7 +19,14 @@ SIMPLIFY_TOL_MM = 0.4           # Douglas-Peucker tolerance before fitting
 # --- recognition ----------------------------------------------------------- #
 CLOSE_TOL_MM = 3.0              # endpoints closer than this = the user meant a closed shape
 LINE_RESIDUAL_MM = 0.8          # max mean deviation to accept a straight line
-CIRCLE_RESIDUAL_MM = 1.2        # max mean radial deviation to accept a circle
+# Calibrated against 325 real mouse-drawn strokes (PK, 2026-09-24), not guessed.
+# Real circles fit with a median radial residual of 2.38 mm (p90 4.17). At the
+# old 1.2 mm only 18% of them passed and the rest fell through to POLYLINE -
+# circle F1 on real input was 0.213. Closed competitors sit far higher (rect
+# median 6.05, polyline 7.05), so 3.0 separates them cleanly: 77% of real
+# circles kept for 16% of rect/polyline wrongly admitted - the best separation
+# in the sweep. Re-derive with scripts/calibrate.py when more data arrives.
+CIRCLE_RESIDUAL_MM = 3.5        # max mean radial deviation to accept a circle
 LOW_CONFIDENCE = 0.55           # below this the UI flags the shape for redraw
 
 # --- geometry -------------------------------------------------------------- #
@@ -35,4 +42,7 @@ MAX_BUILD_MM = (220, 220, 250)  # a common Ender-3 sized build volume
 RECT_FILL_MIN = 0.82           # stroke area / min-area-rect area to accept a RECT
 SMOOTH_WINDOW = 5               # moving-average window for hand tremor; 1 disables
 BRUSH_PX = 2                    # pen width on the canvas; fat strokes round off corners
-CLOSE_FRACTION = 0.06           # gap/length under this also counts as closed
+# Only 63% of PK's real mouse-drawn circles read as closed at 0.06; a circle the
+# app calls open becomes an ARC and never gets a circle fit at all. 0.12 lifts
+# that without letting genuine arcs (which sweep well under a full turn) through.
+CLOSE_FRACTION = 0.12           # gap/length under this also counts as closed
