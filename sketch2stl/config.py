@@ -32,3 +32,4 @@ CUT_OVERSHOOT_MM = 0.5          # extend cuts slightly past the body so the bool
 # --- printability ---------------------------------------------------------- #
 MIN_WALL_MM = 1.2               # thinner than this and most FDM printers cannot do it
 MAX_BUILD_MM = (220, 220, 250)  # a common Ender-3 sized build volume
+RECT_FILL_MIN = 0.82           # stroke area / min-area-rect area to accept a RECT

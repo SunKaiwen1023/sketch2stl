@@ -84,3 +84,18 @@ STL output · datasets · `.venv/` · model weights · `__pycache__/` · anythin
 The `.gitignore` blocks the usual suspects. GitHub hard-rejects files over 100 MB, and removing one from
 history afterwards is genuinely horrible — so if you're about to `git add .` and you're not sure what's in
 there, run `git status` first and look.
+
+## New files since the first commit
+
+| File | Owner | What it is |
+|---|---|---|
+| `sketch2stl/data/fusion360.py` | Serena | Read Fusion 360 CAD JSONs into labelled 2-D curves |
+| `sketch2stl/data/synth.py` | Serena | Clean curve → synthetic hand-drawn stroke |
+| `sketch2stl/recognizer/features.py` | Serena | The 12 stroke features. **Append only** — see below |
+| `scripts/inspect_dataset.py` | Serena | Check the CAD parser against the real files |
+| `scripts/build_dataset.py` | Serena | CAD → labelled strokes |
+| `scripts/train_recognizer.py` | Serena | Train + the three-arm evaluation |
+
+**`FEATURE_NAMES` is append-only.** It is the column order shared between training and inference.
+Insert a feature in the middle and every model you have already trained silently starts reading the
+wrong columns. Add at the end, always.

@@ -16,12 +16,12 @@ Draw a shape by hand. Say whether it adds material or removes it. Give it a dept
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q          # expect: 31 passed, 1 xfailed
+pytest -q          # expect: 47 passed
 python app.py
 ```
 
-Click **Add volume** → **Cut volume** → **Export STL**. You get an 80 × 60 × 20 mm plate with a Ø30 hole —
-the part in the mockup.
+Draw a rectangle → **Add volume**. Draw a circle inside it → **Cut volume**. → **Export STL**.
+You get the plate from the mockup.
 
 **That already works.** The pipeline is real end to end: circle fitting, polygon cleanup, extrusion,
 boolean difference, watertight STL with printability checks. What's stubbed is clearly marked, and the
@@ -59,15 +59,18 @@ Full write-up with figures: **[docs/datasets.md](docs/datasets.md)**. Data on Hu
 | Extrude, union, difference, watertight STL | ✅ works |
 | Printability checks — wall thickness, build volume | ✅ works |
 | Undo / redo, feature stack, step-by-step flow | ✅ works |
-| **Rectangle recognition** | 🔨 stub — `recognizer/rules.py` TODO 1 |
-| **Arc recognition** | 🔨 stub — `recognizer/rules.py` TODO 2 |
-| **ML recogniser** | 🔨 stub — `recognizer/ml.py` |
-| **Real canvas input** | 🔨 stub — `ui/canvas.py`, and see decision D5 |
-| **Stroke stitching** (rect drawn as 4 lines) | 🔨 stub — `profiles.py` TODO 1 |
+| Rectangle recognition (min-area rect + fill ratio) | ✅ works |
+| Arc recognition (circle fit + sweep test) | ✅ works |
+| **Real canvas input** — raster → skeleton → ordered paths | ✅ works |
+| **ML recogniser** — 12 features, classify then least-squares fit | ✅ works, needs training |
+| Fusion 360 CAD parser + synthetic stroke generator | ✅ works |
+| Three-arm evaluation (manual / rules / ml) | ✅ works |
+| **Stroke stitching** (rect drawn as 4 separate lines) | 🔨 stub — `profiles.py` TODO 1 |
 | Sketch planes other than Top | 🔨 stub — `kernel.py` TODO 1 |
+| Extrude from an existing face | 🔨 stub — `kernel.py` TODO 2 |
 
-Until `ui/canvas.py` is done, `app.py` feeds the pipeline a fixed shape so both halves can be developed and
-demoed independently. Delete `_placeholder_strokes` the moment real input works.
+The app runs on the **rules baseline** until you train a model. Once `models/recognizer/model.joblib`
+exists it is picked up automatically on the next start — no code change. The header says which arm is live.
 
 ---
 
@@ -80,21 +83,29 @@ sketch2stl/
 │   ├── types.py              ★ THE DATA CONTRACT — read this first
 │   ├── config.py             ★ every tolerance and magic number
 │   ├── strokes.py            canvas px → clean mm arrays          [Serena]
+│   ├── data/
+│   │   ├── fusion360.py      read Fusion 360 CAD → labelled curves [Serena]
+│   │   └── synth.py          clean curve → synthetic hand stroke  [Serena]
 │   ├── recognizer/
 │   │   ├── base.py           the interface all three arms implement
 │   │   ├── rules.py          least-squares baseline               [Serena]
-│   │   ├── ml.py             learned classifier                   [Serena]
-│   │   └── train.py          training + the 3-arm evaluation      [Serena]
+│   │   ├── features.py       12 hand-designed stroke features     [Serena]
+│   │   └── ml.py             learned classifier                   [Serena]
 │   ├── profiles.py           primitives → closed regions          [PK]
 │   ├── kernel.py             feature stack → mesh                 [PK]
 │   ├── exporter.py           STL + printability                   [PK]
 │   └── session.py            app state, undo, step flow           [split]
 ├── ui/                       canvas [Serena] · preview, layers [PK]
-├── tests/                    31 tests, run them before every push
+├── scripts/
+│   ├── inspect_dataset.py    check the CAD parser against your files
+│   ├── build_dataset.py      CAD → synthetic labelled strokes
+│   └── train_recognizer.py   train + the three-arm evaluation
+├── tests/                    47 tests, run them before every push
 └── docs/
     ├── data_contract.md      ★ how the two halves connect
     ├── architecture.md       why it's built this way
-    ├── decisions.md          the log — 3 decisions still open
+    ├── dataset.md           ★ Fusion 360 licence + how to train
+    ├── decisions.md          the log — 2 decisions still open
     └── roadmap.md            week by week to Oct 5
 ```
 
@@ -129,17 +140,25 @@ Three interchangeable recognition arms, scored on the same held-out strokes:
 | `ml` | A learned classifier on normalised strokes. |
 
 **The result that matters is not "our model gets 94%."** It's whether the learned arm beats a *serious*
-rules baseline by enough to justify existing, and on which shapes. Build the rules arm properly or the
-comparison is worthless.
+rules baseline by enough to justify existing, and on which shapes. `scripts/train_recognizer.py` prints
+exactly that, per class.
 
-And split the stroke dataset **by session, never randomly** — otherwise the model learns your handwriting
-and reports it as shape recognition. Same lesson as HW2's `parent_id` grouping, different costume.
+### Where the training data comes from
+
+The Fusion 360 Gallery dataset has 8,625 real CAD models and **zero hand-drawn strokes** — but every curve
+in it carries a perfect label. So `data/synth.py` distorts clean CAD curves into plausible hand-drawn ones,
+and the label comes along for free. Tens of thousands of labelled strokes, drawn from the shape
+distribution of real engineering parts.
+
+Your own hand-drawn strokes then become the **test set**: train on synthetic, test on real. That
+domain gap is a more interesting result than any in-domain accuracy. See [`docs/dataset.md`](docs/dataset.md)
+— including the licence, which is **not** open and means this data never goes near a public HF dataset.
 
 ---
 
 ## Before you write any code
 
-1. Both of you get to **31 passed** and export an STL (SETUP.md Part 4).
+1. Both of you get to **47 passed** and export an STL (SETUP.md Part 4).
 2. Read [`docs/data_contract.md`](docs/data_contract.md) out loud, together. It's short.
 3. Settle the ownership table in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 4. Answer the three open decisions at the bottom of [`docs/decisions.md`](docs/decisions.md), with dates.

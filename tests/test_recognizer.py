@@ -47,7 +47,7 @@ def test_never_raises_on_junk():
         assert prim is not None
 
 
-@pytest.mark.xfail(reason="TODO: rectangle fitting not implemented - rules.py item 1")
+
 def test_recognizes_a_rectangle():
     pts = []
     for (x0, y0), (x1, y1) in [((40, 30), (120, 30)), ((120, 30), (120, 90)),

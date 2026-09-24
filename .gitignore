@@ -32,3 +32,4 @@ Thumbs.db
 # Gradio
 gradio_cached_examples/
 flagged/
+.github/workflows/

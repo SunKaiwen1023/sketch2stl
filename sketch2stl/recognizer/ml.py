@@ -1,92 +1,184 @@
-"""Learned recogniser. STUB - this is Serena's main build.
+"""The learned recogniser: classify the shape, then fit its parameters exactly.
 
 OWNER: Serena.
 
-Plan, which maps directly onto what HW1 and HW2 already taught you:
+THE DESIGN DECISION THAT MATTERS
+--------------------------------
+The model predicts the shape CLASS only. It never regresses a circle's centre or
+radius. Those come from the same least-squares fitters the rules arm uses.
 
-  DATA   Collect strokes with a label each: line / arc / circle / rect / polyline.
-         Both of you drawing 40 shapes each of 5 classes is 400 samples, which
-         is enough for a small model on 64x2 normalised inputs. Save as a
-         HuggingFace dataset the same way you did for HW1 - split by SESSION
-         (whose hand drew it, on what day), never randomly, or the model learns
-         your handwriting instead of the shape. That is the same parent_id
-         grouping lesson from HW2, in a different costume.
+Why: on a few thousand samples a network will predict a radius to maybe 5 %.
+`fit_circle` gets it to 0.2 % because it is solving the actual problem. And
+because both arms share the fitting code, the evaluation isolates *recognition*
+instead of confounding it with parameter estimation - which is what makes the
+three-arm comparison a real experiment rather than a vibe.
 
-  MODEL  Two options, try the cheap one first:
-         (a) Features + classical model. Compute ~10 hand-designed features from
-             the normalised stroke - closure, aspect ratio, corner count,
-             curvature variance, circle-fit residual, line-fit residual - and
-             throw AutoGluon TabularPredictor at them. This reuses HW2 Problem 1
-             almost line for line, and it will be a strong baseline.
-         (b) Small 1-D CNN over the (64, 2) resampled stroke. More impressive to
-             present, more likely to overfit 400 samples.
-         Report both. The comparison IS the contribution.
-
-  PARAMS Classification alone is not enough - you still need the circle's centre
-         and radius. Do NOT regress those with the network. Classify the shape,
-         then run the matching fitter from rules.py. Much more accurate, and it
-         means the ML arm and the rules arm share their geometry code, so the
-         comparison isolates recognition.
+GRACEFUL DEGRADATION
+--------------------
+If no model is loaded, this falls back to the rules recogniser rather than
+raising. That means `app.py` can point at `MLRecognizer` from day one and the
+app keeps working - the brain gets swapped in later without touching the UI.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 
-from ..strokes import prepare
+from ..config import LOW_CONFIDENCE
+from ..strokes import close_ring, is_closed, prepare
+from ..config import CLOSE_TOL_MM
 from ..types import Primitive, PrimitiveKind, Stroke
 from .base import Recognizer
-from .rules import RuleRecognizer
+from .features import FEATURE_NAMES, extract
+from .rules import RuleRecognizer, circle_points, fit_circle, fit_line
 
 CLASSES = [PrimitiveKind.LINE, PrimitiveKind.ARC, PrimitiveKind.CIRCLE,
            PrimitiveKind.RECT, PrimitiveKind.POLYLINE]
 
 
-def stroke_features(points_mm: np.ndarray) -> dict[str, float]:
-    """Hand-designed features for the classical arm. STUB.
+def fit_params(kind: PrimitiveKind, pts: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Given a predicted class, fit that primitive's exact parameters.
 
-    Return a flat dict - it becomes one row of the training table. Suggested:
-      closure_ratio    dist(first, last) / total arc length
-      aspect_ratio     bbox width / height of the normalised stroke
-      fill_ratio       polygon area / bbox area  (separates circle from rect)
-      n_corners        curvature peaks above a threshold
-      circle_residual  from rules.fit_circle
-      line_residual    from rules.fit_line
-      curvature_std    how much the turning rate varies (low = circle, high = rect)
+    Shared by the ML arm and the rules arm on purpose - see the module docstring.
     """
-    raise NotImplementedError("Serena: see docs/architecture.md section 3")
+    if kind is PrimitiveKind.CIRCLE:
+        cx, cy, r, _ = fit_circle(pts)
+        if r > 0:
+            return circle_points(cx, cy, r), {"cx": cx, "cy": cy, "r": r}
+
+    elif kind is PrimitiveKind.LINE:
+        p0, p1, _ = fit_line(pts)
+        return np.vstack([p0, p1]), {"x1": p0[0], "y1": p0[1], "x2": p1[0], "y2": p1[1]}
+
+    elif kind is PrimitiveKind.ARC:
+        cx, cy, r, _ = fit_circle(pts)
+        if r > 0:
+            a0 = float(np.arctan2(pts[0, 1] - cy, pts[0, 0] - cx))
+            a1 = float(np.arctan2(pts[-1, 1] - cy, pts[-1, 0] - cx))
+            if a1 <= a0:
+                a1 += 2 * np.pi
+            a = np.linspace(a0, a1, 48)
+            arc = np.column_stack([cx + r * np.cos(a), cy + r * np.sin(a)])
+            return arc, {"cx": cx, "cy": cy, "r": r, "a0": a0, "a1": a1}
+
+    elif kind is PrimitiveKind.RECT:
+        rect = _min_area_rect(pts)
+        if rect is not None:
+            return rect
+
+    # POLYLINE, or any fit that failed: hand back the stroke itself.
+    return (close_ring(pts) if is_closed(pts, CLOSE_TOL_MM) else pts), {}
+
+
+def _min_area_rect(pts: np.ndarray) -> tuple[np.ndarray, dict] | None:
+    """Minimum-area enclosing rectangle, via shapely. Also used by the rules arm."""
+    try:
+        from shapely.geometry import MultiPoint
+        rect = MultiPoint([tuple(p) for p in pts]).minimum_rotated_rectangle
+        ring = np.asarray(rect.exterior.coords, dtype=np.float64)
+    except Exception:
+        return None
+    if len(ring) < 5:
+        return None
+    e0 = ring[1] - ring[0]
+    e1 = ring[2] - ring[1]
+    w, h = float(np.linalg.norm(e0)), float(np.linalg.norm(e1))
+    centre = ring[:4].mean(axis=0)
+    angle = float(np.arctan2(e0[1], e0[0]))
+    return ring, {"cx": float(centre[0]), "cy": float(centre[1]),
+                  "w": w, "h": h, "angle": angle}
 
 
 class MLRecognizer(Recognizer):
+    """Feature-based classifier. Falls back to rules when no model is loaded."""
+
     name = "ml"
 
     def __init__(self, model_path: str | Path | None = None) -> None:
         self.model = None
+        self.classes_: list[PrimitiveKind] = []
+        self.meta: dict = {}
         self.fallback = RuleRecognizer()
-        if model_path is not None:
+        if model_path is not None and Path(model_path).exists():
             self.load(model_path)
 
+    # --- persistence ------------------------------------------------------ #
     def load(self, model_path: str | Path) -> None:
-        """Load a trained model. STUB.
+        import joblib
+        model_path = Path(model_path)
+        bundle = joblib.load(model_path / "model.joblib" if model_path.is_dir() else model_path)
+        self.model = bundle["model"]
+        self.classes_ = [PrimitiveKind(c) for c in bundle["classes"]]
+        self.meta = bundle.get("meta", {})
+        if bundle.get("features") != FEATURE_NAMES:
+            raise ValueError(
+                "This model was trained on a different feature set. FEATURE_NAMES has "
+                "changed since it was saved - retrain, or check that new features were "
+                "appended at the end rather than inserted."
+            )
 
-        If you go the AutoGluon route this is TabularPredictor.load(path).
-        If you go the CNN route it is torch.load plus model.eval().
+    @staticmethod
+    def save(model, classes: list[str], out_dir: str | Path, meta: dict | None = None) -> Path:
+        """Save the classifier. `classes` is IGNORED if the model knows its own order.
+
+        This matters more than it looks. `predict_proba` returns columns in the
+        MODEL's class order - sklearn sorts them alphabetically - which is not
+        the order you happened to list them in. Indexing your own list with
+        sklearn's column index silently returns the wrong label for every
+        prediction, while `predict()` keeps working, so the training report
+        looks perfect and the deployed app is nonsense. Found exactly that way.
         """
-        raise NotImplementedError("Serena: see recognizer/train.py")
+        import joblib
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        model_classes = getattr(model, "classes_", None)
+        if model_classes is None and hasattr(model, "steps"):       # a Pipeline
+            model_classes = getattr(model.steps[-1][1], "classes_", None)
+        if model_classes is None:
+            model_classes = getattr(model, "class_labels", None)    # AutoGluon
+        classes = [str(c) for c in model_classes] if model_classes is not None else list(classes)
+
+        joblib.dump({"model": model, "classes": classes,
+                     "features": FEATURE_NAMES, "meta": meta or {}},
+                    out / "model.joblib")
+        with open(out / "meta.json", "w", encoding="utf-8") as f:
+            json.dump({"classes": classes, "features": FEATURE_NAMES, **(meta or {})},
+                      f, indent=2, default=str)
+        return out / "model.joblib"
+
+    # --- inference -------------------------------------------------------- #
+    def predict_kind(self, pts_mm: np.ndarray) -> tuple[PrimitiveKind, float]:
+        x = np.array([[extract(pts_mm)[k] for k in FEATURE_NAMES]], dtype=np.float64)
+        if hasattr(self.model, "predict_proba"):
+            proba = np.asarray(self.model.predict_proba(x))[0]
+            i = int(proba.argmax())
+            return self.classes_[i], float(proba[i])
+        pred = self.model.predict(x)[0]
+        return PrimitiveKind(pred), 1.0
 
     def recognize(self, stroke: Stroke) -> Primitive:
-        # Until the model exists, degrade to rules rather than crash. This means
-        # you can wire the UI to MLRecognizer from day one and swap the brain in
-        # later without touching anything else.
         if self.model is None:
             p = self.fallback.recognize(stroke)
             return Primitive(p.kind, p.points, p.params, p.confidence, source="rules")
 
         pts = prepare(stroke)
         if pts is None:
-            return Primitive(PrimitiveKind.POLYLINE, np.zeros((0, 2)), confidence=0.0, source="ml")
+            return Primitive(PrimitiveKind.POLYLINE, np.zeros((0, 2)),
+                             confidence=0.0, source="ml")
 
-        # kind = self.model.predict(...)
-        # then call the matching fitter from rules.py to get the parameters
-        raise NotImplementedError("Serena: classify here, then fit with rules.py")
+        kind, conf = self.predict_kind(pts)
+
+        # A closed stroke cannot be a line, and an open one is not a circle.
+        # Geometry beats the classifier on questions geometry can answer outright.
+        closed = is_closed(pts, CLOSE_TOL_MM)
+        if closed and kind is PrimitiveKind.LINE:
+            kind, conf = PrimitiveKind.POLYLINE, min(conf, LOW_CONFIDENCE)
+        if not closed and kind is PrimitiveKind.CIRCLE:
+            kind, conf = PrimitiveKind.ARC, min(conf, LOW_CONFIDENCE)
+
+        points, params = fit_params(kind, pts)
+        return Primitive(kind=kind, points=points, params=params,
+                         confidence=conf, source="ml")

@@ -5,16 +5,14 @@ OWNER: Serena.
 This is the baseline the ML arm has to beat. It is deliberately simple and
 deliberately good - a weak baseline makes the ML result meaningless.
 
-WHAT WORKS TODAY: circle fitting and the closed-polyline fallback. That is
-enough for the app to run end to end, which is the point of the scaffold.
-WHAT IS STUBBED: line, arc and rectangle fitting. See the TODOs.
+All five primitive types now fit. What remains is polish - see the TODOs.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from ..config import (ARC_SEGMENTS, CIRCLE_RESIDUAL_MM, CLOSE_TOL_MM,
-                      LINE_RESIDUAL_MM)
+                      LINE_RESIDUAL_MM, RECT_FILL_MIN)
 from ..strokes import close_ring, is_closed, prepare
 from ..types import Primitive, PrimitiveKind, Stroke
 from .base import Recognizer
@@ -61,6 +59,68 @@ def circle_points(cx: float, cy: float, r: float, n: int = ARC_SEGMENTS) -> np.n
     return close_ring(ring)
 
 
+def fit_rect(points: np.ndarray) -> tuple[np.ndarray, dict, float] | None:
+    """Minimum-area enclosing rectangle. Returns (ring, params, fill_ratio).
+
+    `fill_ratio` is the stroke's own enclosed area divided by the rectangle's.
+    A real rectangle scores near 1.0; a circle scores ~0.64 (pi/4 of its
+    bounding square); a random blob scores lower still. That single number is
+    what turns "here is a box around the points" into a decision.
+    """
+    try:
+        from shapely.geometry import MultiPoint, Polygon
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        rect = MultiPoint([tuple(p) for p in pts]).minimum_rotated_rectangle
+        ring = np.asarray(rect.exterior.coords, dtype=np.float64)
+        if len(ring) < 5 or rect.area <= 0:
+            return None
+        stroke_poly = Polygon(close_ring(pts))
+        if not stroke_poly.is_valid:
+            stroke_poly = stroke_poly.buffer(0)
+        fill = float(stroke_poly.area / rect.area) if rect.area > 0 else 0.0
+    except Exception:
+        return None
+
+    e0, e1 = ring[1] - ring[0], ring[2] - ring[1]
+    w, h = float(np.linalg.norm(e0)), float(np.linalg.norm(e1))
+    if w <= 0 or h <= 0:
+        return None
+    centre = ring[:4].mean(axis=0)
+    return ring, {"cx": float(centre[0]), "cy": float(centre[1]), "w": w, "h": h,
+                  "angle": float(np.arctan2(e0[1], e0[0]))}, fill
+
+
+def fit_arc(points: np.ndarray) -> tuple[np.ndarray, dict, float] | None:
+    """Circle-fit an OPEN stroke and keep the swept portion.
+
+    Rejected if the sweep is nearly a full turn - that means the user drew a
+    circle and closed it sloppily, and calling it an arc would be pedantic.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    cx, cy, r, res = fit_circle(pts)
+    if r <= 0 or res > CIRCLE_RESIDUAL_MM:
+        return None
+
+    a0 = float(np.arctan2(pts[0, 1] - cy, pts[0, 0] - cx))
+    a1 = float(np.arctan2(pts[-1, 1] - cy, pts[-1, 0] - cx))
+    mid = pts[len(pts) // 2]
+    am = float(np.arctan2(mid[1] - cy, mid[0] - cx))
+
+    # walk the direction that actually passes through the stroke's midpoint
+    def sweep(start, end):
+        return (end - start) % (2 * np.pi)
+
+    if sweep(a0, am) > sweep(a0, a1):
+        a0, a1 = a1, a0
+    span = sweep(a0, a1)
+    if span < np.deg2rad(20) or span > np.deg2rad(340):
+        return None
+
+    a = np.linspace(a0, a0 + span, 48)
+    ring = np.column_stack([cx + r * np.cos(a), cy + r * np.sin(a)])
+    return ring, {"cx": cx, "cy": cy, "r": r, "a0": a0, "a1": a0 + span}, res
+
+
 class RuleRecognizer(Recognizer):
     name = "rules"
 
@@ -84,7 +144,22 @@ class RuleRecognizer(Recognizer):
                     confidence=max(conf, 0.6),
                     source="rules",
                 )
-            # TODO: rectangle fit goes here, before the polyline fallback.
+            rect = fit_rect(pts)
+            if rect is not None:
+                ring, params, fill = rect
+                # A rectangle fills its own bounding box; a blob does not. The
+                # fill ratio is what separates them, and it is scale-free.
+                if fill >= RECT_FILL_MIN:
+                    conf = float(np.clip((fill - RECT_FILL_MIN) / (1.0 - RECT_FILL_MIN),
+                                         0.0, 1.0))
+                    return Primitive(
+                        kind=PrimitiveKind.RECT,
+                        points=ring,
+                        params=params,
+                        confidence=max(conf, 0.6),
+                        source="rules",
+                    )
+
             return Primitive(
                 kind=PrimitiveKind.POLYLINE,
                 points=close_ring(pts),
@@ -104,27 +179,28 @@ class RuleRecognizer(Recognizer):
                 source="rules",
             )
 
-        # TODO: arc fit goes here.
+        arc = fit_arc(pts)
+        if arc is not None:
+            ring, params, res = arc
+            conf = float(np.clip(1.0 - res / CIRCLE_RESIDUAL_MM, 0.0, 1.0))
+            return Primitive(
+                kind=PrimitiveKind.ARC,
+                points=ring,
+                params=params,
+                confidence=max(conf, 0.6),
+                source="rules",
+            )
+
         return Primitive(PrimitiveKind.POLYLINE, pts, confidence=0.4, source="rules")
 
 
 # --------------------------------------------------------------------------- #
 # TODO (Serena), in order of how much they buy you:
 #
-#  1. RECTANGLE. Biggest win - most of the mockup is rectangles. Approach: take
-#     the convex hull, find the minimum-area enclosing rectangle (rotating
-#     calipers, or shapely's `minimum_rotated_rectangle`), and accept it if the
-#     stroke's area is close to the rectangle's area. Fill in params
-#     {cx, cy, w, h, angle}.
-#
-#  2. ARC. Fit a circle to an OPEN stroke, then take a0/a1 from the first and
-#     last points. Accept only if the swept angle is under ~340 degrees,
-#     otherwise the user meant a circle and closed it sloppily.
-#
-#  3. AXIS SNAPPING. If a fitted line is within ~5 degrees of horizontal or
+#  1. AXIS SNAPPING. If a fitted line is within ~5 degrees of horizontal or
 #     vertical, snap it. Cheap, and it makes the output look dramatically more
 #     intentional - which matters a lot in a demo.
 #
-#  4. DIMENSION ROUNDING. Snap a fitted radius of 14.8 mm to 15 mm. Same idea:
+#  2. DIMENSION ROUNDING. Snap a fitted radius of 14.8 mm to 15 mm. Same idea:
 #     the user is drawing by hand but thinking in round numbers.
 # --------------------------------------------------------------------------- #
