@@ -63,23 +63,45 @@ code — so the evaluation isolates recognition instead of confounding it with p
 
 ---
 
-# OPEN — decide these in your first hour and write the answers here
+## D5 — Vectorise the raster; the JS canvas stays on the shelf.
 
-## D5 — How do we get ordered strokes out of the canvas?
+**2026-09-24 · implemented**
 
-Gradio's Sketchpad returns an image, not pen paths.
+Gradio's Sketchpad returns an image, not pen paths. `ui/canvas.py` thresholds the ink, skeletonises it,
+splits it into connected components and walks each into an ordered path.
 
-- **(a) Vectorise the raster.** Threshold → skeletonise → trace. Works with stock Gradio. Loses stroke
-  order and timing, adds a scikit-image dependency.
-- **(b) Custom JS canvas** via `gr.HTML` posting JSON back. True ordered paths with timestamps — much
-  better input for recognition — at the cost of ~80 lines of JavaScript.
+**Cost:** stroke order and timing are gone. Clockwise and anticlockwise look identical, and there is no
+speed signal.
 
-*Recommendation: ship (a) to get end-to-end working this week, then attempt (b). The ML arm is far more
-interesting with (b)'s data.*
+**Why it's acceptable:** none of the twelve features in `recognizer/features.py` uses direction or time.
+It works with stock Gradio, deploys to Spaces unchanged, and needs no JavaScript.
 
-**Decided:** _____________  **by:** _____________  **on:** _____________
+**Revisit if** recognition accuracy stalls and you have spare time. `strokes_from_json` is still there
+and still works, so option (b) is a frontend job, not a rewrite.
 
 ---
+
+## D8 — Training data is synthesised from Fusion 360 CAD, not hand-collected.
+
+**2026-09-24 · Serena**
+
+The Fusion 360 Gallery has 8,625 CAD models with perfectly labelled curves and no hand-drawn strokes.
+`data/synth.py` distorts the clean curves into plausible hand-drawn ones; the label carries over free.
+
+**Why:** tens of thousands of labelled strokes instead of 400, drawn from the shape distribution of real
+engineering parts. It also unblocks D7 — the hand-drawn collection is no longer on the critical path.
+
+**What it changes about D7:** hand-drawn strokes are now the TEST set, not the training set. That makes
+them a domain-gap measurement, which is a better result and needs far fewer of them (~100 is plenty).
+
+**Risk:** if the distortion model is unfaithful, the classifier learns a fantasy. Mitigated by
+`synth.deviation()` — calibrate against real strokes and report both numbers.
+
+---
+
+# OPEN — decide these in your first hour and write the answers here
+
+
 
 ## D6 — How many shape classes?
 
@@ -93,11 +115,11 @@ then say so and explain why.
 
 ---
 
-## D7 — How many strokes are we each collecting, and by when?
+## D7 — How many REAL strokes for the domain-gap test, and by when?
 
-The ML arm needs data and it doesn't exist yet. 40 shapes × 5 classes × 2 people ≈ 400 samples.
+D8 removed this from the critical path — training data is synthetic now. What you still need is a
+**test** set of real hand-drawn strokes: roughly 100 total, ~20 per class, both of you.
 
-Put a **date** on this. It's the item most likely to slip, and everything in Serena's half is blocked
-behind it.
+Record who drew each one. Put a date on it.
 
 **Decided:** _____________  **by:** _____________  **on:** _____________

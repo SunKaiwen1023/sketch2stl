@@ -9,7 +9,8 @@ gradio>=4.44
 
 # --- recognition ----------------------------------------------------------- #
 scikit-learn>=1.4       # least-squares fits, and the classical ML arm
-scikit-image>=0.22      # skeletonisation, if you take option (a) for the canvas
+scikit-image>=0.22      # skeletonisation for the drawing canvas (required)
+
 
 # --- dev ------------------------------------------------------------------- #
 pytest>=8.0
@@ -17,3 +18,5 @@ pytest>=8.0
 # Add autogluon.tabular here ONLY if you take the AutoGluon route for the ML
 # arm. It is a large install and it will slow the HF Space build considerably,
 # so train locally, commit the model, and load it at runtime instead.
+joblib>=1.3             # saving and loading the trained recogniser
+matplotlib>=3.8         # confusion matrices in the training script
