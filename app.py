@@ -19,7 +19,8 @@ from pathlib import Path
 
 import gradio as gr
 
-from sketch2stl.config import CANVAS_H, CANVAS_W, DEFAULT_DEPTH_MM, LOW_CONFIDENCE
+from sketch2stl.config import (BRUSH_PX, CANVAS_H, CANVAS_W, DEFAULT_DEPTH_MM,
+                               LOW_CONFIDENCE)
 from sketch2stl.exporter import check, export_stl
 from sketch2stl.kernel import stats
 from sketch2stl.profiles import profile_area, profile_from_primitive
@@ -27,7 +28,7 @@ from sketch2stl.recognizer import RuleRecognizer
 from sketch2stl.recognizer.ml import MLRecognizer
 from sketch2stl.session import Session
 from sketch2stl.types import Op
-from ui.canvas import strokes_from_image
+from ui.canvas import render_recognition, strokes_from_image
 from ui.layers import HEADERS, to_rows
 from ui.preview import mesh_to_preview_file
 
@@ -46,6 +47,11 @@ print(f"recogniser: {ARM}")
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _session(state) -> Session:
+    """gr.State starts as None in Gradio 6 - see the module docstring."""
+    return state if isinstance(state, Session) else Session()
+
+
 def _panels(session: Session, message: str = ""):
     """Rebuild the solid and return everything the right-hand side shows."""
     mesh, err = session.solid()
@@ -67,10 +73,12 @@ def _panels(session: Session, message: str = ""):
 
 
 def _read_canvas(sketch):
-    """Canvas -> (profile, description) or (None, why not)."""
+    """Canvas -> (profile, description, recognition_preview)."""
+    from sketch2stl.strokes import prepare
+
     strokes = strokes_from_image(sketch)
     if not strokes:
-        return None, "The canvas is empty - draw a closed shape first."
+        return None, "The canvas is empty - draw a closed shape first.", None
 
     prims = RECOGNIZER.recognize_batch(strokes)
     candidates = []
@@ -81,8 +89,9 @@ def _read_canvas(sketch):
 
     if not candidates:
         kinds = ", ".join(sorted({p.kind.value for p in prims}))
+        shot = render_recognition(prepare(strokes[0]), prims[0]) if prims else None
         return None, (f"Found {len(prims)} stroke(s) ({kinds}) but none encloses an area. "
-                      f"Draw a closed outline - join the ends up.")
+                      f"Draw a closed outline - join the ends up."), shot
 
     # largest closed region wins; a stray tick mark should not become the part
     prim, profile, area = max(candidates, key=lambda t: t[2])
@@ -91,60 +100,66 @@ def _read_canvas(sketch):
         note += f" — used the largest of {len(candidates)} closed shapes"
     if prim.confidence < LOW_CONFIDENCE:
         note += "\n⚠ low confidence — redraw more clearly if this is not what you meant"
-    return profile, note
+
+    raw = next((prepare(st) for st, pr in zip(strokes, prims) if pr is prim), None)
+    return profile, note, render_recognition(raw, prim)
 
 
 def _commit(sketch, depth, z_base, op: Op, session: Session):
-    profile, note = _read_canvas(sketch)
+    profile, note, shot = _read_canvas(sketch)
     if profile is None:
-        _, rows, _ = _panels(session)
-        return None, rows, note, session
+        prev, rows, _ = _panels(session)
+        return prev, rows, note, shot, gr.update(), session
 
     session.submit_profile(profile)
     session.choose_op(op)
     try:
         feat = session.commit(depth=float(depth), z_base=float(z_base))
     except Exception as exc:                        # noqa: BLE001 - shown to the user
-        _, rows, _ = _panels(session)
-        return None, rows, str(exc), session
+        prev, rows, _ = _panels(session)
+        return prev, rows, str(exc), shot, gr.update(), session
 
     preview, rows, msg = _panels(
         session, f"{note}\nAdded as **{feat.name}** — {op.value} {feat.depth:g} mm "
                  f"from z={feat.z_base:g}")
-    return preview, rows, msg, session
+    # Wipe the canvas. `strokes_from_image` reads the WHOLE canvas every time, so
+    # a leftover shape would be re-recognised and re-added on the next click.
+    return preview, rows, msg + "\n\n*Canvas cleared — draw the next shape.*", shot, None, session
 
 
 # --------------------------------------------------------------------------- #
 # callbacks
 # --------------------------------------------------------------------------- #
-def on_preview(sketch, session: Session):
+def on_preview(sketch, state):
     """Recognise without committing, so the user can check before building."""
-    _, note = _read_canvas(sketch)
+    session = _session(state)
+    _, note, shot = _read_canvas(sketch)
     _, rows, _ = _panels(session)
-    return rows, note, session
+    return rows, note, shot, session
 
 
-def on_add(sketch, depth, z_base, session):
-    return _commit(sketch, depth, z_base, Op.ADD, session)
+def on_add(sketch, depth, z_base, state):
+    return _commit(sketch, depth, z_base, Op.ADD, _session(state))
 
 
-def on_cut(sketch, depth, z_base, session):
-    return _commit(sketch, depth, z_base, Op.CUT, session)
+def on_cut(sketch, depth, z_base, state):
+    return _commit(sketch, depth, z_base, Op.CUT, _session(state))
 
 
-def on_undo(session: Session):
+def on_undo(state):
+    session = _session(state)
     ok = session.undo()
     preview, rows, msg = _panels(session, "Undone." if ok else "Nothing to undo.")
-    return preview, rows, msg, session
+    return preview, rows, msg, gr.update(), gr.update(), session
 
 
-def on_clear(_session):
+def on_clear(_state):
     session = Session()
-    return None, [], "Cleared. Draw a shape to begin.", session
+    return None, [], "Cleared. Draw a shape to begin.", None, None, session
 
 
-def on_export(session: Session):
-    mesh, err = session.solid()
+def on_export(state):
+    mesh, err = _session(state).solid()
     if mesh is None:
         return None, err or "Nothing to export yet - add a shape first."
     path = Path(tempfile.gettempdir()) / "sketch3d_part.stl"
@@ -156,8 +171,8 @@ def on_export(session: Session):
 # --------------------------------------------------------------------------- #
 # layout
 # --------------------------------------------------------------------------- #
-with gr.Blocks(title="Sketch3D", theme=gr.themes.Soft()) as demo:
-    session = gr.State(Session)
+with gr.Blocks(title="Sketch3D") as demo:
+    session = gr.State()          # filled by _session() on first use
 
     gr.Markdown(
         f"""# Sketch3D
@@ -173,11 +188,18 @@ what is already there. Repeat, then export an STL.
             sketch = gr.Sketchpad(
                 height=CANVAS_H, width=CANVAS_W, label=None, type="numpy",
                 canvas_size=(CANVAS_W, CANVAS_H),
+                # A fat brush blurs corners together and the skeletoniser then
+                # rounds them off, so rectangles start reading as blobs.
+                brush=gr.Brush(default_size=BRUSH_PX, colors=["#000000"],
+                               default_color="#000000", color_mode="fixed"),
             )
             gr.Markdown(
                 f"<sub>The canvas is {CANVAS_W / 4:.0f} x {CANVAS_H / 4:.0f} mm. "
                 f"Draw one closed outline at a time.</sub>"
             )
+
+            recognised = gr.Image(label="What I recognised  (grey = your stroke, blue = the fitted shape)",
+                                  height=200, interactive=False)
 
             gr.Markdown("### 2. Depth")
             with gr.Row():
@@ -199,8 +221,7 @@ what is already there. Repeat, then export an STL.
             status = gr.Markdown("Draw a shape to begin.")
 
             gr.Markdown("### Features / Layers")
-            layers = gr.Dataframe(headers=HEADERS, label=None, interactive=False,
-                                  row_count=(0, "dynamic"))
+            layers = gr.Dataframe(headers=HEADERS, label=None, interactive=False)
             with gr.Row():
                 export_btn = gr.Button("Export STL", variant="primary")
                 stl_file = gr.File(label="STL")
@@ -220,8 +241,8 @@ is why undo is instant and the preview can never drift out of sync with the list
             """
         )
 
-    outs = [preview, layers, status, session]
-    preview_btn.click(on_preview, [sketch, session], [layers, status, session])
+    outs = [preview, layers, status, recognised, sketch, session]
+    preview_btn.click(on_preview, [sketch, session], [layers, status, recognised, session])
     add_btn.click(on_add, [sketch, depth, z_base, session], outs)
     cut_btn.click(on_cut, [sketch, depth, z_base, session], outs)
     undo_btn.click(on_undo, [session], outs)
@@ -230,4 +251,8 @@ is why undo is instant and the preview can never drift out of sync with the list
 
 
 if __name__ == "__main__":
-    demo.launch()
+    # `theme` belongs to launch() in Gradio 6; older versions take it on Blocks().
+    try:
+        demo.launch(theme=gr.themes.Soft())
+    except TypeError:
+        demo.launch()

@@ -19,3 +19,4 @@ pytest>=8.0
 # arm. It is a large install and it will slow the HF Space build considerably,
 # so train locally, commit the model, and load it at runtime instead.
 joblib>=1.3             # saving and loading the trained recogniser
+matplotlib>=3.8         # confusion matrices in the training script

@@ -154,6 +154,40 @@ def _affine(pts: np.ndarray, slant_deg: float, scale_jitter: float,
     return (pts - centre) @ m.T + centre
 
 
+def to_canvas_scale(points: np.ndarray, rng: np.random.Generator | None = None,
+                    target_min: float = 25.0, target_max: float = 100.0,
+                    centre: tuple[float, float] = (80.0, 60.0)) -> np.ndarray:
+    """Rescale a CAD curve to a size a person would plausibly draw it at.
+
+    THIS MUST HAPPEN BEFORE `handdraw`, and leaving it out is a subtle and
+    damaging bug.
+
+    Real parts in the Fusion dataset range from a 3 mm pin to a 2 m beam. A
+    person draws all of them at roughly canvas size, and hand tremor is in
+    CANVAS units - your hand does not shake proportionally to the thing you are
+    depicting. Distorting a curve at its native scale means the 2 m beam gets
+    0.45 % relative noise (unrealistically clean) while the 3 mm pin gets 9.4 %
+    (an unrecognisable mess).
+
+    The classifier then learns "big shapes are clean, small shapes are noisy" -
+    a rule that is pure artefact and cannot possibly hold at inference time,
+    because by then every stroke arrives at canvas scale.
+
+    Measured on circles before this fix: deviation ran 0.38 mm at 4 mm across
+    and 9.10 mm at 2000 mm across. After it, deviation is flat.
+    """
+    rng = rng or np.random.default_rng()
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    # The sheet is 160 x 120 mm, so the SHORT side is the binding constraint.
+    # A 140 mm target centred at y=60 would run off the top and bottom.
+    extent = float(np.max(hi - lo))
+    if extent <= 1e-9:
+        return pts
+    target = float(rng.uniform(target_min, target_max))
+    return (pts - (lo + hi) / 2.0) * (target / extent) + np.asarray(centre, dtype=np.float64)
+
+
 def handdraw(points: np.ndarray, style: HandStyle = TYPICAL,
              rng: np.random.Generator | None = None,
              closed: bool | None = None) -> np.ndarray:

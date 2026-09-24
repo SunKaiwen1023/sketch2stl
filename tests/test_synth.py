@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from sketch2stl.data.synth import NEAT, SHAKY, TYPICAL, deviation, handdraw
 from sketch2stl.recognizer import RuleRecognizer
@@ -47,3 +48,47 @@ def test_closed_shapes_stay_roughly_closed():
     gaps = [np.linalg.norm(s[0] - s[-1]) for s in
             (handdraw(circle(), TYPICAL, rng, closed=True) for _ in range(20))]
     assert np.median(gaps) < 4.0
+
+
+def test_deviation_no_longer_scales_with_part_size():
+    """A 2 m beam and a 3 mm pin are both drawn at canvas size by a real hand.
+
+    Before to_canvas_scale existed, deviation ran 0.38 mm on a 4 mm circle and
+    9.10 mm on a 2000 mm one - a 24x spread. The classifier would have learned
+    "big shapes are clean", which is a pure artefact of the synthesis.
+    """
+    from sketch2stl.data.synth import to_canvas_scale
+
+    rng = np.random.default_rng(0)
+    devs = []
+    for r in (2.0, 10.0, 50.0, 250.0, 1000.0):
+        base = to_canvas_scale(circle(r), rng)
+        devs.append(np.mean([deviation(handdraw(base, TYPICAL, rng), base)
+                             for _ in range(5)]))
+    devs = np.array(devs)
+    assert devs.max() / devs.min() < 2.0, f"still size-dependent: {devs.round(3)}"
+    assert devs.max() < 1.5, f"too shaky for a hand: {devs.round(3)}"
+
+
+def test_canvas_scale_lands_inside_the_sheet():
+    from sketch2stl.config import CANVAS_H, CANVAS_W, PX_PER_MM
+    from sketch2stl.data.synth import to_canvas_scale
+
+    rng = np.random.default_rng(1)
+    for r in (2.0, 1000.0):
+        out = to_canvas_scale(circle(r), rng)
+        lo, hi = out.min(axis=0), out.max(axis=0)
+        assert lo[0] > -1 and lo[1] > -1
+        assert hi[0] < CANVAS_W / PX_PER_MM + 1 and hi[1] < CANVAS_H / PX_PER_MM + 1
+
+
+def test_canvas_scale_preserves_shape():
+    """Rescaling must not distort - that is handdraw's job."""
+    from sketch2stl.data.synth import to_canvas_scale
+
+    src = circle(37.0)
+    out = to_canvas_scale(src, np.random.default_rng(2))
+    c_src, c_out = src.mean(axis=0), out.mean(axis=0)
+    r_src = np.linalg.norm(src - c_src, axis=1)
+    r_out = np.linalg.norm(out - c_out, axis=1)
+    assert r_src.std() / r_src.mean() == pytest.approx(r_out.std() / r_out.mean(), abs=1e-9)

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from sketch2stl.config import MIN_STROKE_PTS
+from sketch2stl.config import CANVAS_H, CANVAS_W, MIN_STROKE_PTS
 from sketch2stl.types import Stroke
 
 MIN_COMPONENT_PX = 40          # smaller than this is a stray tap, not a stroke
@@ -70,36 +70,90 @@ def _ink_mask(image) -> np.ndarray | None:
     return dark if dark.mean() < 0.5 else ~dark
 
 
+MAX_STEP_PX = 4.0        # skeleton neighbours are at most sqrt(2) apart
+STITCH_PX = 14.0         # how far apart two runs may be and still be one stroke
+
+
 def _order_component(coords: np.ndarray) -> np.ndarray:
     """Walk a skeleton component's pixels into an ordered path.
 
-    Greedy nearest-neighbour from the point furthest from the centroid, which on
-    an open stroke is an endpoint and on a closed one is an arbitrary but
-    perfectly good starting point.
+    Greedy nearest-neighbour, but in SEGMENTS, then stitched back together.
+
+    The naive version - one greedy walk that stops at the first big jump - throws
+    away most of the stroke. Skeletonising a hand-drawn line leaves short spurs
+    and the odd two-pixel-wide patch; the walk wanders into a spur, exhausts it,
+    finds nothing nearby and quits. Measured on a shaky circle: 584 skeleton
+    pixels in, 41 points out, spanning 3.8 mm instead of 30. The circle fit then
+    returned r = 1.8 mm for a 15 mm circle, and the app cut a hole the size of a
+    pinhead.
+
+    So: when the walk stalls, start a NEW segment from the furthest remaining
+    point instead of stopping. Then stitch segments whose ends nearly meet. A
+    spur becomes a short segment that gets dropped; a ring split in two by a
+    thick patch gets rejoined.
     """
     pts = coords.astype(np.float64)
     if len(pts) < 3:
         return pts
 
-    start = int(np.argmax(np.linalg.norm(pts - pts.mean(axis=0), axis=1)))
+    centroid = pts.mean(axis=0)
     remaining = np.ones(len(pts), dtype=bool)
-    order = [start]
-    remaining[start] = False
-    current = pts[start]
+    segments: list[list[int]] = []
 
-    for _ in range(len(pts) - 1):
+    while remaining.any():
         idx = np.flatnonzero(remaining)
-        d = np.linalg.norm(pts[idx] - current, axis=1)
-        j = idx[int(np.argmin(d))]
-        # a big jump means the walk finished this branch; stop rather than
-        # teleporting across the shape and inventing a chord
-        if d.min() > 6.0:
-            break
-        order.append(j)
-        remaining[j] = False
-        current = pts[j]
+        start = idx[int(np.argmax(np.linalg.norm(pts[idx] - centroid, axis=1)))]
+        seg = [int(start)]
+        remaining[start] = False
+        current = pts[start]
 
-    return pts[order]
+        while True:
+            idx = np.flatnonzero(remaining)
+            if len(idx) == 0:
+                break
+            d = np.linalg.norm(pts[idx] - current, axis=1)
+            if d.min() > MAX_STEP_PX:
+                break
+            j = int(idx[int(np.argmin(d))])
+            seg.append(j)
+            remaining[j] = False
+            current = pts[j]
+
+        segments.append(seg)
+
+    if not segments:
+        return pts
+
+    segments.sort(key=len, reverse=True)
+    path = list(segments.pop(0))
+
+    # stitch: repeatedly attach whichever leftover run comes closest to an end
+    changed = True
+    while changed and segments:
+        changed = False
+        head, tail = pts[path[0]], pts[path[-1]]
+        best = None
+        for k, seg in enumerate(segments):
+            if len(seg) < 3:
+                continue
+            a, b = pts[seg[0]], pts[seg[-1]]
+            for dist, where, rev in (
+                (np.linalg.norm(tail - a), "end", False),
+                (np.linalg.norm(tail - b), "end", True),
+                (np.linalg.norm(head - b), "start", False),
+                (np.linalg.norm(head - a), "start", True),
+            ):
+                if dist <= STITCH_PX and (best is None or dist < best[0]):
+                    best = (dist, k, where, rev)
+        if best is not None:
+            _, k, where, rev = best
+            seg = segments.pop(k)
+            if rev:
+                seg = seg[::-1]
+            path = (path + seg) if where == "end" else (seg + path)
+            changed = True
+
+    return pts[path]
 
 
 def strokes_from_image(image) -> list[Stroke]:
@@ -154,3 +208,36 @@ def strokes_from_json(payload: str) -> list[Stroke]:
         t = np.asarray(item["t"], dtype=np.float64) if item.get("t") else None
         out.append(Stroke(points=pts, t=t))
     return out
+
+
+def render_recognition(raw_mm, primitive, size=(CANVAS_W, CANVAS_H)):
+    """Draw what the user drew (grey) under what we recognised (blue).
+
+    The app already replaces a wobbly stroke with an exact primitive - that is
+    what `fit_params` does - but the user never SEES it happen, because the
+    canvas keeps showing their original scrawl. This is the missing feedback:
+    proof that the snap occurred, and a way to catch a bad recognition before
+    committing it to the model.
+    """
+    from PIL import Image, ImageDraw
+
+    from sketch2stl.strokes import mm_to_px
+
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+
+    for x in range(0, size[0], 40):
+        d.line([(x, 0), (x, size[1])], fill="#f0f0f0")
+    for y in range(0, size[1], 40):
+        d.line([(0, y), (size[0], y)], fill="#f0f0f0")
+
+    if raw_mm is not None and len(raw_mm) > 1:
+        d.line([tuple(p) for p in mm_to_px(raw_mm)], fill="#c9c9c9", width=5, joint="curve")
+
+    if primitive is not None and len(primitive.points) > 1:
+        pts = [tuple(p) for p in mm_to_px(primitive.points)]
+        d.line(pts, fill="#2a6fdb", width=3, joint="curve")
+        for p in pts[::max(1, len(pts) // 24)]:
+            d.ellipse([p[0] - 2, p[1] - 2, p[0] + 2, p[1] + 2], fill="#2a6fdb")
+
+    return np.asarray(img)

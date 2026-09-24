@@ -15,13 +15,18 @@ HEADERS = ["#", "Name", "Operation", "Depth (mm)", "Base Z (mm)", "Visible"]
 
 def to_rows(doc: Document) -> list[list]:
     """Newest feature last, matching the build order."""
-    return [
-        [i + 1, f.name,
-         "Extrude (New Body)" if i == 0 else
-         ("Extrude (Cut)" if f.op.value == "cut" else "Extrude (Add)"),
-         round(f.depth, 2), round(f.z_base, 2), "yes" if f.visible else "no"]
-        for i, f in enumerate(doc.features)
-    ]
+    rows = []
+    for i, f in enumerate(doc.features):
+        # Label by what the feature DOES, not by its position. Row 1 used to read
+        # "Extrude (New Body)" unconditionally, so a cut placed first - which is
+        # an error, there is nothing to cut from - looked like a valid base solid.
+        if f.op.value == "cut":
+            op = "Extrude (Cut)"
+        else:
+            op = "Extrude (New Body)" if i == 0 else "Extrude (Add)"
+        rows.append([i + 1, f.name, op, round(f.depth, 2), round(f.z_base, 2),
+                     "yes" if f.visible else "no"])
+    return rows
 
 
 # TODO (PK): let the user click a row to edit its depth, and re-run build().

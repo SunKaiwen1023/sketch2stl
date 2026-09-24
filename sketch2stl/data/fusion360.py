@@ -28,12 +28,13 @@ UNITS AND GEOMETRY
 Fusion 360 works in centimetres and radians. Everything returned here is
 converted to MILLIMETRES to match the rest of this codebase.
 
-Sketch curves are stored as 3-D points in world space, but they all lie on the
-sketch's plane. Each sketch carries a `transform` with an origin and x/y/z axes,
-so the 2-D sketch coordinate of a point is just its projection onto that basis:
+Curve coordinates are already in each sketch's OWN frame, so x/y are the sketch
+coordinates directly - no projection onto the sketch basis. See `_to_2d` for the
+evidence in the data.
 
-    u = (p - origin) . x_axis
-    v = (p - origin) . y_axis
+Points come in two forms depending on where the curve lives: inline dicts inside
+`profiles`, or UUID references into the sketch's `points` table inside `curves`.
+`_resolve` handles both.
 
 LICENSE - READ THIS
 -------------------
@@ -95,82 +96,88 @@ class CadCurve:
 
 def _vec(d: dict | None, keys=("x", "y", "z")) -> np.ndarray:
     """Pull a vector out of Fusion's {"x":..,"y":..,"z":..} dicts."""
-    if d is None:
+    if not isinstance(d, dict):
         return np.zeros(3)
     return np.array([float(d.get(k, 0.0)) for k in keys])
 
 
-def _basis(sketch: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(origin, x_axis, y_axis) for a sketch, in cm. Falls back to world XY."""
-    t = sketch.get("transform") or sketch.get("reference_plane") or {}
-    origin = _vec(t.get("origin"))
-    x_axis = _vec(t.get("x_axis")) if t.get("x_axis") else np.array([1.0, 0.0, 0.0])
-    y_axis = _vec(t.get("y_axis")) if t.get("y_axis") else np.array([0.0, 1.0, 0.0])
-    for ax, default in ((x_axis, [1.0, 0, 0]), (y_axis, [0, 1.0, 0])):
-        n = np.linalg.norm(ax)
-        if n < 1e-9:
-            ax[:] = default
-        else:
-            ax /= n
-    return origin, x_axis, y_axis
+def _resolve(ref, points: dict) -> dict | None:
+    """A point is either inline, or a UUID into the sketch's `points` table.
+
+    The two places curves live use different conventions:
+
+      profiles -> loops -> profile_curves   inline {"type":"Point3D","x":..}
+      curves                                "c7780e6e-e2f3-11ea-..." (a UUID)
+
+    Writing the parser against only the first form is what made
+    `'str' object has no attribute 'get'` show up on the very first real file.
+    """
+    if isinstance(ref, dict):
+        return ref
+    if isinstance(ref, str):
+        return points.get(ref)
+    return None
 
 
-def _to_2d(p3: np.ndarray, origin: np.ndarray,
-           x_axis: np.ndarray, y_axis: np.ndarray) -> np.ndarray:
-    """World 3-D point (cm) -> sketch 2-D point (mm)."""
-    d = p3 - origin
-    return np.array([float(d @ x_axis), float(d @ y_axis)]) * CM_TO_MM
+def _to_2d(p: dict | None, points: dict) -> np.ndarray | None:
+    """A curve's point -> 2-D sketch coordinates in MILLIMETRES.
 
+    NO PROJECTION IS NEEDED - the coordinates are already in the sketch's own
+    frame, not world space. The evidence is in the data: a circle whose stored
+    `normal` is (0, 0, 1) sits in a sketch whose `z_axis` is (1, 0, 0). If the
+    curve were in world coordinates its normal would have to match the sketch's
+    z-axis. It does not, so the curve is expressed sketch-locally and x/y are
+    the sketch coordinates directly.
 
-def _line(curve: dict, o, xa, ya) -> tuple[np.ndarray, dict] | None:
-    s = curve.get("start_point")
-    e = curve.get("end_point")
-    if s is None or e is None:
+    Projecting onto the sketch basis - which is what this function used to do -
+    silently produced garbage for every sketch not on the world XY plane.
+    """
+    d = _resolve(p, points)
+    if d is None:
         return None
-    p0 = _to_2d(_vec(s), o, xa, ya)
-    p1 = _to_2d(_vec(e), o, xa, ya)
-    if np.linalg.norm(p1 - p0) < 1e-6:
+    return np.array([float(d.get("x", 0.0)), float(d.get("y", 0.0))]) * CM_TO_MM
+
+
+def _line(curve: dict, points: dict) -> tuple[np.ndarray, dict] | None:
+    p0 = _to_2d(curve.get("start_point"), points)
+    p1 = _to_2d(curve.get("end_point"), points)
+    if p0 is None or p1 is None or np.linalg.norm(p1 - p0) < 1e-6:
         return None
     return np.vstack([p0, p1]), {"x1": p0[0], "y1": p0[1], "x2": p1[0], "y2": p1[1]}
 
 
-def _circle(curve: dict, o, xa, ya) -> tuple[np.ndarray, dict] | None:
-    c = curve.get("center_point")
+def _circle(curve: dict, points: dict) -> tuple[np.ndarray, dict] | None:
+    centre = _to_2d(curve.get("center_point"), points)
     r = curve.get("radius")
-    if c is None or r is None:
+    if centre is None or r is None:
         return None
-    centre = _to_2d(_vec(c), o, xa, ya)
     radius = float(r) * CM_TO_MM
     if radius <= 0:
         return None
     a = np.linspace(0.0, 2 * np.pi, ARC_SEGMENTS, endpoint=False)
     pts = np.column_stack([centre[0] + radius * np.cos(a), centre[1] + radius * np.sin(a)])
-    pts = np.vstack([pts, pts[:1]])
-    return pts, {"cx": centre[0], "cy": centre[1], "r": radius}
+    return np.vstack([pts, pts[:1]]), {"cx": centre[0], "cy": centre[1], "r": radius}
 
 
-def _arc(curve: dict, o, xa, ya) -> tuple[np.ndarray, dict] | None:
-    c = curve.get("center_point")
+def _arc(curve: dict, points: dict) -> tuple[np.ndarray, dict] | None:
+    centre = _to_2d(curve.get("center_point"), points)
     r = curve.get("radius")
-    if c is None or r is None:
+    if centre is None or r is None:
         return None
-    centre = _to_2d(_vec(c), o, xa, ya)
     radius = float(r) * CM_TO_MM
     if radius <= 0:
         return None
 
-    # Prefer the stored angles; fall back to deriving them from the endpoints,
+    # Prefer the stored angles; derive them from the endpoints otherwise,
     # because not every record carries both.
-    a0 = curve.get("start_angle")
-    a1 = curve.get("end_angle")
+    a0, a1 = curve.get("start_angle"), curve.get("end_angle")
     if a0 is None or a1 is None:
-        s = curve.get("start_point")
-        e = curve.get("end_point")
+        s = _to_2d(curve.get("start_point"), points)
+        e = _to_2d(curve.get("end_point"), points)
         if s is None or e is None:
             return None
-        p0 = _to_2d(_vec(s), o, xa, ya) - centre
-        p1 = _to_2d(_vec(e), o, xa, ya) - centre
-        a0, a1 = np.arctan2(p0[1], p0[0]), np.arctan2(p1[1], p1[0])
+        d0, d1 = s - centre, e - centre
+        a0, a1 = np.arctan2(d0[1], d0[0]), np.arctan2(d1[1], d1[0])
     a0, a1 = float(a0), float(a1)
     if a1 <= a0:
         a1 += 2 * np.pi
@@ -182,36 +189,51 @@ def _arc(curve: dict, o, xa, ya) -> tuple[np.ndarray, dict] | None:
     return pts, {"cx": centre[0], "cy": centre[1], "r": radius, "a0": a0, "a1": a1}
 
 
-_BUILDERS = {PrimitiveKind.LINE: _line, PrimitiveKind.CIRCLE: _circle, PrimitiveKind.ARC: _arc}
+_BUILDERS = {PrimitiveKind.LINE: _line, PrimitiveKind.CIRCLE: _circle,
+             PrimitiveKind.ARC: _arc}
 
 
 def curves_from_model(data: dict, model_id: str = "") -> list[CadCurve]:
-    """All 2-D sketch curves in one reconstruction JSON."""
+    """All 2-D sketch curves in one reconstruction JSON.
+
+    Curves live in two places and the PROFILES path is strictly better:
+
+      profiles -> loops -> profile_curves   inline coordinates, plus `is_outer`
+                                            telling you outer ring vs hole
+      curves                                UUID references into `points`, and
+                                            includes construction geometry
+
+    So profiles first, the curve table only as a fallback for sketches that
+    were never turned into a profile.
+    """
     out: list[CadCurve] = []
     entities = data.get("entities") or {}
 
     for sketch_id, ent in entities.items():
         if ent.get("type") != "Sketch":
             continue
-        o, xa, ya = _basis(ent)
+        points = ent.get("points") or {}
 
-        # Curves appear in two places: a flat `curves` dict, and nested inside
-        # `profiles -> loops -> profile_curves`. Walk both and de-duplicate,
-        # because which one is populated varies across the dataset.
-        raw: list[dict] = []
-        cdict = ent.get("curves")
-        if isinstance(cdict, dict):
-            raw.extend(c for c in cdict.values() if isinstance(c, dict))
+        raw: list[tuple[dict, bool]] = []
         for prof in (ent.get("profiles") or {}).values():
             for loop in prof.get("loops") or []:
-                raw.extend(c for c in (loop.get("profile_curves") or []) if isinstance(c, dict))
+                for c in loop.get("profile_curves") or []:
+                    if isinstance(c, dict):
+                        raw.append((c, bool(loop.get("is_outer", True))))
+
+        if not raw:
+            for c in (ent.get("curves") or {}).values():
+                # construction geometry is scaffolding the designer drew to
+                # position real geometry against - it is not part of the shape
+                if isinstance(c, dict) and not c.get("construction_geom"):
+                    raw.append((c, True))
 
         seen: set[tuple] = set()
-        for curve in raw:
+        for curve, is_outer in raw:
             kind = CURVE_TYPE_MAP.get(curve.get("type") or curve.get("curve_type") or "")
             if kind is None:
                 continue
-            built = _BUILDERS[kind](curve, o, xa, ya)
+            built = _BUILDERS[kind](curve, points)
             if built is None:
                 continue
             pts, params = built
@@ -220,6 +242,7 @@ def curves_from_model(data: dict, model_id: str = "") -> list[CadCurve]:
             if key in seen:
                 continue
             seen.add(key)
+            params = {**params, "is_outer": float(is_outer)}
             out.append(CadCurve(kind, pts, params, model_id, sketch_id))
 
     return out

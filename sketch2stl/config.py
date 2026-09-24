@@ -33,3 +33,6 @@ CUT_OVERSHOOT_MM = 0.5          # extend cuts slightly past the body so the bool
 MIN_WALL_MM = 1.2               # thinner than this and most FDM printers cannot do it
 MAX_BUILD_MM = (220, 220, 250)  # a common Ender-3 sized build volume
 RECT_FILL_MIN = 0.82           # stroke area / min-area-rect area to accept a RECT
+SMOOTH_WINDOW = 5               # moving-average window for hand tremor; 1 disables
+BRUSH_PX = 2                    # pen width on the canvas; fat strokes round off corners
+CLOSE_FRACTION = 0.06           # gap/length under this also counts as closed

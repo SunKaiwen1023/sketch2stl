@@ -42,8 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sketch2stl.config import RESAMPLE_N                                   # noqa: E402
 from sketch2stl.data.fusion360 import (curves_from_model, iter_models,     # noqa: E402
                                        load_split, operations_from_model)
-from sketch2stl.data.synth import STYLES, deviation, handdraw              # noqa: E402
-from sketch2stl.strokes import resample                                    # noqa: E402
+from sketch2stl.data.synth import (STYLES, deviation, handdraw,  # noqa: E402
+                                   to_canvas_scale)              # noqa: E402
+from sketch2stl.strokes import prepare_points, resample                    # noqa: E402
 from sketch2stl.types import PrimitiveKind                                 # noqa: E402
 
 # Only these three come straight from the CAD file. RECT and POLYLINE are
@@ -107,7 +108,17 @@ def _polyline_from_curves(curves, rng) -> np.ndarray | None:
     return np.vstack([out, out[:1]])
 
 
-def collect(root, model_ids, per_class, style, rng, max_models=None):
+def _draw(clean, style, rng, rescale=True, closed=None):
+    """Rescale to canvas size, then distort. Returns (stroke, clean_at_canvas_scale).
+
+    The deviation must be measured against the RESCALED curve, not the original -
+    otherwise it reports the rescaling, not the hand.
+    """
+    base = to_canvas_scale(clean, rng) if rescale else np.asarray(clean, dtype=np.float64)
+    return handdraw(base, style, rng, closed=closed), base
+
+
+def collect(root, model_ids, per_class, style, rng, max_models=None, rescale=True):
     """Walk the CAD models and emit synthetic strokes, balanced across classes."""
     quota = Counter()
     strokes, labels, owners, devs = [], [], [], []
@@ -126,32 +137,32 @@ def collect(root, model_ids, per_class, style, rng, max_models=None):
         for c in curves:
             if c.kind not in CAD_CLASSES or quota[c.kind] >= per_class:
                 continue
-            stroke = handdraw(c.points, style, rng)
-            strokes.append(resample(stroke, RESAMPLE_N))
+            stroke, base = _draw(c.points, style, rng, rescale)
+            strokes.append(prepare_points(stroke))
             labels.append(c.kind.value)
             owners.append(model_id)
-            devs.append(deviation(stroke, c.points))
+            devs.append(deviation(stroke, base))
             quota[c.kind] += 1
 
         # the two we construct
         if quota[PrimitiveKind.RECT] < per_class:
             ring = _rect_from_lines(curves, rng)
             if ring is not None:
-                stroke = handdraw(ring, style, rng, closed=True)
-                strokes.append(resample(stroke, RESAMPLE_N))
+                stroke, base = _draw(ring, style, rng, rescale, closed=True)
+                strokes.append(prepare_points(stroke))
                 labels.append(PrimitiveKind.RECT.value)
                 owners.append(model_id)
-                devs.append(deviation(stroke, ring))
+                devs.append(deviation(stroke, base))
                 quota[PrimitiveKind.RECT] += 1
 
         if quota[PrimitiveKind.POLYLINE] < per_class:
             blob = _polyline_from_curves(curves, rng)
             if blob is not None:
-                stroke = handdraw(blob, style, rng, closed=True)
-                strokes.append(resample(stroke, RESAMPLE_N))
+                stroke, base = _draw(blob, style, rng, rescale, closed=True)
+                strokes.append(prepare_points(stroke))
                 labels.append(PrimitiveKind.POLYLINE.value)
                 owners.append(model_id)
-                devs.append(deviation(stroke, blob))
+                devs.append(deviation(stroke, base))
                 quota[PrimitiveKind.POLYLINE] += 1
 
         if n_models % 250 == 0:
@@ -178,6 +189,11 @@ def main() -> None:
     ap.add_argument("--style", default="typical", choices=list(STYLES))
     ap.add_argument("--seed", type=int, default=20260922)
     ap.add_argument("--max-models", type=int, default=None, help="cap, for a quick trial run")
+    ap.add_argument("--no-rescale", action="store_true",
+                    help="skip canvas rescaling - an ablation, not a normal run. "
+                         "Distortion is then applied at each part's native size, so a "
+                         "2 m beam gets near-zero relative noise and a 3 mm pin gets 9%. "
+                         "Useful to quantify how much that artefact was worth.")
     args = ap.parse_args()
 
     style = STYLES[args.style]
@@ -194,6 +210,7 @@ def main() -> None:
         split = {"train": None, "test": None}
 
     meta = {"style": args.style, "seed": args.seed, "resample_n": RESAMPLE_N,
+            "canvas_rescale": not args.no_rescale,
             "source": "Fusion 360 Gallery Dataset (Reconstruction), synthesised strokes",
             "licence": "Autodesk non-commercial research. Do not redistribute publicly."}
 
@@ -202,7 +219,8 @@ def main() -> None:
         print(f"\n=== {name} ===")
         rng = np.random.default_rng(args.seed + (0 if name == "train" else 1))
         X, y, owner, dev, n_models, ops = collect(
-            args.data, ids, per_class, style, rng, args.max_models)
+            args.data, ids, per_class, style, rng, args.max_models,
+            rescale=not args.no_rescale)
 
         if len(X) == 0:
             print("  NOTHING EXTRACTED. Run scripts/inspect_dataset.py to find out why.")
@@ -213,7 +231,11 @@ def main() -> None:
         counts = dict(Counter(y.tolist()))
         print(f"  {len(X)} strokes from {n_models} models -> {out / (name + '.npz')}")
         print(f"  per class: {counts}")
-        print(f"  mean deviation from the clean curve: {dev.mean():.2f} mm")
+        print(f"  mean deviation from the clean curve: {dev.mean():.2f} mm "
+              f"(sd {dev.std():.2f}, max {dev.max():.2f})")
+        if dev.mean() > 1.5:
+            print("  !! that is high for a hand. Expect 0.3-0.8 mm. Check --no-rescale "
+                  "is not set, or lower HandStyle.tremor_mm in sketch2stl/data/synth.py.")
         meta[name] = {"n": int(len(X)), "n_models": n_models, "per_class": counts,
                       "mean_deviation_mm": float(dev.mean())}
         if name == "train" and ops:
