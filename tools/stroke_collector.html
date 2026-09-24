@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stroke Collector</title>
+<!--
+  Hand-drawn stroke collector for sketch2stl (the manual dataset).
+  Open this file in a browser (double-click). No server, no internet needed.
+  Each stroke is saved with ordered pen points in CANVAS PIXELS (640 x 480, y down)
+  and per-point timestamps, which is exactly what types.Stroke expects.
+  Press "Download session" at the end and put the JSON in data/strokes/raw/.
+-->
+<style>
+  :root { --bg:#f6f6f4; --ink:#1d1d1f; --muted:#6b6b70; --line:#d9d9d6; --accent:#e8590c; --ok:#2b8a3e; --card:#ffffff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161617; --ink:#ececec; --muted:#9a9aa0; --line:#333336; --card:#1f1f21; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; }
+  label { font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }
+  input, select { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  .prompt { margin:16px 0 8px; padding:12px 14px; background:var(--card); border:1px solid var(--line); border-radius:10px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  .prompt b { font-size:22px; letter-spacing:.02em; }
+  .prompt span { color:var(--muted); }
+  .stage { width:100%; max-width:640px; aspect-ratio: 4 / 3; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#fff; touch-action:none; }
+  canvas { width:100%; height:100%; display:block; touch-action:none; cursor:crosshair; }
+  .layout { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  .side { flex:1 1 220px; min-width:220px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  td { padding:4px 0; border-bottom:1px solid var(--line); }
+  td.n { text-align:right; font-variant-numeric: tabular-nums; }
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .hint { color:var(--muted); font-size:13px; margin-top:8px; }
+  .actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .done { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Stroke collector · sketch2stl</h1>
+  <div class="row">
+    <div><label for="author">Your name</label><input id="author" placeholder="PK or Serena" size="12"></div>
+    <div><label for="device">Device</label>
+      <select id="device"><option>mouse</option><option>trackpad</option><option>pen/tablet</option><option>touch</option></select></div>
+    <div><label for="per">Strokes per shape</label><input id="per" type="number" value="60" min="5" max="200" style="width:80px"></div>
+    <button id="start" class="primary">Start session</button>
+  </div>
+
+  <div class="prompt" id="prompt" hidden>
+    <div>Draw a <b id="kind">—</b></div>
+    <span id="desc"></span>
+  </div>
+
+  <div class="layout">
+    <div class="stage" style="flex:2 1 400px"><canvas id="cv" width="640" height="480" aria-label="Drawing canvas"></canvas></div>
+    <div class="side">
+      <table id="progress"></table>
+      <div class="actions">
+        <button id="accept" class="primary" disabled>Accept ↵</button>
+        <button id="redo" disabled>Redo ⌫</button>
+        <button id="undo" disabled>Undo last</button>
+      </div>
+      <div class="actions">
+        <button id="download" disabled>Download session</button>
+      </div>
+      <p class="hint">Draw each shape in <b>one stroke</b> without lifting. Vary size, position and speed like you would in the app.
+        Enter = accept, Backspace = redo. Progress is autosaved in this browser.</p>
+      <p id="status" class="hint"></p>
+    </div>
+  </div>
+</main>
+<script>
+const CLASSES = ["line","arc","circle","rect","polyline"];
+const DESC = {
+  line: "a straight line, any direction",
+  arc: "part of a circle, left open (not closed)",
+  circle: "a closed circle",
+  rect: "a rectangle or square, all four sides in one stroke",
+  polyline: "any other closed shape: triangle, hexagon, L-shape, slot, blob…"
+};
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+let session = null, queue = [], current = null, drawing = false;
+
+function store(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} }
+function recall(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
+
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+function counts() { const c = Object.fromEntries(CLASSES.map(k => [k, 0])); session.strokes.forEach(s => c[s.label]++); return c; }
+
+function buildQueue() {
+  const c = counts(), q = [];
+  CLASSES.forEach(k => { for (let i = c[k]; i < session.per; i++) q.push(k); });
+  queue = shuffle(q);
+}
+
+function grid() {
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, 640, 480);
+  ctx.strokeStyle = "#eef0f2"; ctx.lineWidth = 1;
+  for (let x = 0; x <= 640; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 480); ctx.stroke(); }
+  for (let y = 0; y <= 480; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(640, y); ctx.stroke(); }
+}
+
+function drawStroke(pts) {
+  if (!pts.length) return;
+  ctx.strokeStyle = "#1d1d1f"; ctx.lineWidth = 2.5; ctx.lineJoin = ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (const p of pts) ctx.lineTo(p[0], p[1]);
+  ctx.stroke();
+}
+
+function render() {
+  const c = counts(), total = CLASSES.length * session.per, n = session.strokes.length;
+  $("progress").innerHTML = CLASSES.map(k =>
+    `<tr><td>${k}</td><td class="n">${c[k]} / ${session.per}</td></tr>
+     <tr><td colspan="2"><div class="bar"><i style="width:${Math.min(100, 100 * c[k] / session.per)}%"></i></div></td></tr>`).join("") +
+    `<tr><td><b>total</b></td><td class="n"><b>${n} / ${total}</b></td></tr>`;
+  const next = queue[0];
+  if (next) { $("kind").textContent = next.toUpperCase(); $("desc").textContent = DESC[next]; }
+  else { $("kind").innerHTML = '<span class="done">All done — download your session</span>'; $("desc").textContent = ""; }
+  $("accept").disabled = !(current && current.points.length >= 4 && next);
+  $("redo").disabled = !current;
+  $("undo").disabled = !n;
+  $("download").disabled = !n;
+  store("s2s_session", session);
+}
+
+function pos(e) {
+  const r = cv.getBoundingClientRect();
+  return [ (e.clientX - r.left) * 640 / r.width, (e.clientY - r.top) * 480 / r.height ];
+}
+
+cv.addEventListener("pointerdown", e => {
+  if (!session || !queue.length) return;
+  e.preventDefault(); cv.setPointerCapture(e.pointerId);
+  drawing = true; grid();
+  current = { t0: performance.now(), points: [pos(e)], t: [0] };
+});
+cv.addEventListener("pointermove", e => {
+  if (!drawing) return;
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of evs) { current.points.push(pos(ev)); current.t.push((performance.now() - current.t0) / 1000); }
+  grid(); drawStroke(current.points);
+});
+function endStroke() { if (!drawing) return; drawing = false; render(); }
+cv.addEventListener("pointerup", endStroke);
+cv.addEventListener("pointercancel", endStroke);
+
+function accept() {
+  if (!current || current.points.length < 4 || !queue.length) return;
+  const label = queue.shift();
+  const r = v => Math.round(v * 100) / 100;
+  session.strokes.push({
+    stroke_id: `${session.session_id}_${String(session.strokes.length).padStart(4, "0")}`,
+    label, points: current.points.map(p => [r(p[0]), r(p[1])]), t: current.t.map(v => Math.round(v * 1000) / 1000)
+  });
+  current = null; grid(); render();
+  $("status").textContent = `Saved ${label}.`;
+}
+function redo() { current = null; grid(); render(); }
+function undo() {
+  const s = session.strokes.pop(); if (!s) return;
+  queue.unshift(s.label); current = null; grid(); render();
+  $("status").textContent = `Removed the last ${s.label}.`;
+}
+
+$("accept").onclick = accept; $("redo").onclick = redo; $("undo").onclick = undo;
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "Enter") { e.preventDefault(); accept(); }
+  if (e.key === "Backspace") { e.preventDefault(); redo(); }
+});
+
+$("start").onclick = () => {
+  const author = $("author").value.trim();
+  if (!author) { $("status").textContent = "Type your name first."; $("author").focus(); return; }
+  const saved = recall("s2s_session");
+  const now = new Date(), date = now.toISOString().slice(0, 10);
+  if (saved && saved.author === author && saved.strokes.length && confirm(`Resume ${author}'s unfinished session (${saved.strokes.length} strokes)?`)) {
+    session = saved;
+  } else {
+    const stamp = now.toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    session = { session_id: `${author.toLowerCase().replace(/\W+/g, "")}_${stamp}`, author, device: $("device").value,
+                date, canvas: [640, 480], per: Math.max(5, +$("per").value || 60), strokes: [] };
+  }
+  $("prompt").hidden = false; buildQueue(); grid(); render();
+  $("status").textContent = `Session ${session.session_id}`;
+};
+
+$("download").onclick = () => {
+  const blob = new Blob([JSON.stringify(session)], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = `${session.session_id}.json`; a.click(); URL.revokeObjectURL(a.href);
+  $("status").textContent = `Downloaded ${session.session_id}.json — put it in data/strokes/raw/`;
+};
+
+grid();
+</script>
+</body>
+</html>

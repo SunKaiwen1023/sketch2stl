@@ -32,6 +32,22 @@ New to git? → **[SETUP.md](SETUP.md)**, which starts from installing it.
 
 ---
 
+## Data and ML process (so far)
+
+Full write-up with figures: **[docs/datasets.md](docs/datasets.md)**. Data on Hugging Face: **[pakiino/sketch2stl-datasets](https://huggingface.co/datasets/pakiino/sketch2stl-datasets)**.
+
+| | ML 1 — stroke recognizer | ML 2 — smart suggestions |
+| --- | --- | --- |
+| Question | What kind of stroke is this? | ADD or CUT, and how thick? |
+| Category | Trained from scratch (+ fine-tuned arm for comparison) | Fine-tuned ResNet-18 |
+| Manual data | 325 hand-drawn + 197 human-reviewed = **522** | — |
+| Training data | 29,387 synthetic strokes from Fusion 360 | 19,273 extrude steps from Fusion 360 |
+| Baseline to beat | Rules: 3% on real circles | 64.6% ADD/CUT; thickness off ~3.6× |
+
+![Hand-drawn strokes, 10 per class](docs/figures/hand_PK_sample.png)
+
+---
+
 ## What works, what doesn't
 
 | | Status |
