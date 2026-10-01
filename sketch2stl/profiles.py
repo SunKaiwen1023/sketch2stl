@@ -82,6 +82,16 @@ def profile_from_primitive(prim: Primitive) -> Profile | None:
     return polygon_to_profile(poly, simplify=tol)
 
 
+def profile_from_points(points: np.ndarray) -> Profile | None:
+    """A closed ring of points -> a valid Profile, or None if it encloses nothing.
+
+    Goes through shapely's repair path, same as every other profile, so a
+    self-touching hand-drawn ring is cleaned rather than rejected.
+    """
+    poly = _to_polygon(points)
+    return polygon_to_profile(poly) if poly is not None else None
+
+
 def profiles_from_primitives(prims: list[Primitive]) -> list[Profile]:
     """Every primitive that can stand alone as a closed region."""
     out = []
@@ -118,3 +128,95 @@ def profile_area(profile: Profile) -> float:
 #  4. A guard against absurd profiles - area under ~1 mm^2, or an aspect ratio
 #     over ~200:1 - with a clear message rather than a downstream mesh failure.
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Half + centreline mode, added 29 Sep.
+#
+# The user draws HALF an outline against a centreline, the way you would in
+# Fusion or SolidWorks. Because the centreline is drawn rather than inferred,
+# there is no axis to guess and no axis error to make - which is the whole
+# argument for the mode.
+#
+# A half profile is genuinely ambiguous: mirrored and extruded it is a block,
+# revolved it is a cylinder, and the drawing contains nothing that decides
+# between them. That is PK's ML2 v2 question, and the UI shows both so the
+# person picks. MIRROR is implemented here because it is profile geometry;
+# REVOLVE is PK's kernel work.
+# --------------------------------------------------------------------------- #
+
+def mirror_half(points: np.ndarray, axis) -> np.ndarray:
+    """Reflect a half outline across `axis` and close it into a full ring.
+
+    The half path is expected to run from one end of the centreline to the
+    other, on one side. Its mirror image, reversed, completes the ring.
+    """
+    from .types import Axis                                  # local: avoid cycle
+    if not isinstance(axis, Axis):
+        raise TypeError("mirror_half needs an Axis")
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 3:
+        raise ValueError("a half profile needs at least 3 points")
+
+    d = axis.direction
+    rel = pts - axis.point
+    along = rel @ d
+    perp = rel[:, 0] * d[1] - rel[:, 1] * d[0]
+    # Reflect: keep the along-axis component, negate the perpendicular one.
+    mirrored = (axis.point
+                + along[:, None] * d
+                - perp[:, None] * np.array([d[1], -d[0]]))
+
+    ring = np.vstack([pts, mirrored[::-1][1:]])
+    if np.linalg.norm(ring[0] - ring[-1]) > 1e-9:
+        ring = np.vstack([ring, ring[:1]])
+    return ring
+
+
+def close_to_axis(points: np.ndarray, axis) -> np.ndarray:
+    """Close a half outline onto its own centreline, without mirroring it.
+
+    This is the REVOLVE counterpart to `mirror_half`. A revolve only ever needs
+    the half the user drew, but `Profile` is a closed region by contract - and
+    the ghost underlay has to draw something. So the ring is the half plus a
+    return leg straight down the centreline: geometrically the shape that is
+    swept, and entirely on one side of the axis, which is what the Feature
+    contract requires.
+    """
+    from .types import Axis                                  # local: avoid cycle
+    if not isinstance(axis, Axis):
+        raise TypeError("close_to_axis needs an Axis")
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 3:
+        raise ValueError("a half profile needs at least 3 points")
+
+    d = axis.direction
+    rel = pts - axis.point
+    along = rel @ d
+    foot = axis.point + along[:, None] * d       # each point dropped onto the axis
+
+    ring = np.vstack([pts, foot[-1:], foot[:1]])
+    if np.linalg.norm(ring[0] - ring[-1]) > 1e-9:
+        ring = np.vstack([ring, ring[:1]])
+    return ring
+
+
+def fold_to_one_side(points: np.ndarray, axis) -> np.ndarray:
+    """Push any points that stray across the centreline back onto it.
+
+    People overshoot the axis by a millimetre or two. Rejecting the whole
+    drawing for that would be unkind, and a profile that crosses its own axis
+    is rejected by the Feature contract, so fold instead of fail.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    d = axis.direction
+    rel = pts - axis.point
+    perp = rel[:, 0] * d[1] - rel[:, 1] * d[0]
+    side = 1.0 if float(np.sum(perp)) >= 0 else -1.0
+    wrong = (perp * side) < 0
+    if not wrong.any():
+        return pts
+    out = pts.copy()
+    n = np.array([d[1], -d[0]])
+    out[wrong] = pts[wrong] - perp[wrong, None] * n
+    return out

@@ -132,33 +132,53 @@ class RuleRecognizer(Recognizer):
 
         closed = is_closed(pts, CLOSE_TOL_MM)
 
-        # --- closed shapes: try a circle first ----------------------------- #
+        # --- closed shapes: score circle AND rect, pick the better --------- #
+        #
+        # This used to be first-match-wins with circle tested first, and that
+        # broke when CIRCLE_RESIDUAL_MM was raised from 1.2 to 3.5 during the
+        # 24 Sep calibration. The looser threshold was needed - real mouse-drawn
+        # circles fit at a median 2.38 mm - but it also admits rectangles: a
+        # 63 x 51 mm rectangle fits a circle at 3.32 mm, just inside the budget,
+        # and returned CIRCLE before fit_rect was ever called.
+        #
+        # Both candidates are now scored on how far INSIDE their own acceptance
+        # criterion they sit, which is scale-free and comparable. That rectangle
+        # scores 0.05 as a circle and 0.87 as a rect. A real hand-drawn circle
+        # scores ~0.3 as a circle and fails the rect fill test outright, because
+        # a disc only fills pi/4 = 0.785 of its bounding box.
         if closed:
+            best = None
+
             cx, cy, r, res = fit_circle(pts)
             if res <= CIRCLE_RESIDUAL_MM and r > 0:
-                conf = float(np.clip(1.0 - res / CIRCLE_RESIDUAL_MM, 0.0, 1.0))
-                return Primitive(
+                score = float(np.clip(1.0 - res / CIRCLE_RESIDUAL_MM, 0.0, 1.0))
+                best = (score, Primitive(
                     kind=PrimitiveKind.CIRCLE,
                     points=circle_points(cx, cy, r),
                     params={"cx": cx, "cy": cy, "r": r},
-                    confidence=max(conf, 0.6),
+                    confidence=max(score, 0.6),
                     source="rules",
-                )
+                ))
+
             rect = fit_rect(pts)
             if rect is not None:
                 ring, params, fill = rect
                 # A rectangle fills its own bounding box; a blob does not. The
                 # fill ratio is what separates them, and it is scale-free.
                 if fill >= RECT_FILL_MIN:
-                    conf = float(np.clip((fill - RECT_FILL_MIN) / (1.0 - RECT_FILL_MIN),
-                                         0.0, 1.0))
-                    return Primitive(
-                        kind=PrimitiveKind.RECT,
-                        points=ring,
-                        params=params,
-                        confidence=max(conf, 0.6),
-                        source="rules",
-                    )
+                    score = float(np.clip((fill - RECT_FILL_MIN) / (1.0 - RECT_FILL_MIN),
+                                          0.0, 1.0))
+                    if best is None or score > best[0]:
+                        best = (score, Primitive(
+                            kind=PrimitiveKind.RECT,
+                            points=ring,
+                            params=params,
+                            confidence=max(score, 0.6),
+                            source="rules",
+                        ))
+
+            if best is not None:
+                return best[1]
 
             return Primitive(
                 kind=PrimitiveKind.POLYLINE,

@@ -17,7 +17,7 @@ import trimesh
 
 from .config import DEFAULT_DEPTH_MM
 from .kernel import KernelError, build
-from .types import Document, Feature, Op, Profile
+from .types import Axis, Document, Feature, FeatureKind, Op, Profile
 
 Step = Literal["draw", "choose_op", "set_depth", "review"]
 
@@ -28,8 +28,54 @@ class Session:
     step: Step = "draw"
     pending_profile: Profile | None = None
     pending_op: Op | None = None
-    _undo: list[list[Feature]] = field(default_factory=list)
-    _redo: list[list[Feature]] = field(default_factory=list)
+
+    # --- ink already turned into features, per canvas ---------------------- #
+    #
+    # WHY THIS EXISTS. The app used to clear the canvas after every build by
+    # returning a fresh image to the Sketchpad. That is what left the canvas
+    # sitting on a loading animation: any component in an event's output list
+    # is marked pending when the click is dispatched, and a Sketchpad that does
+    # not resolve cleanly stays that way until some other event completes.
+    #
+    # So the canvas is no longer written to AT ALL. Instead the ink that has
+    # already been committed is remembered here, and the next read processes
+    # only what is new. The user's earlier strokes stay on the canvas, which is
+    # also a better answer to "show me where I drew the last one" than the pale
+    # ghost was - it is the actual drawing rather than a rendering of it.
+    #
+    # Keyed by canvas ("free" / "half") so switching modes does not retire ink
+    # on the other one.
+    consumed: dict = field(default_factory=dict)
+
+    # Corners clicked in click-to-place mode, in canvas pixels, per canvas.
+    clicked: dict = field(default_factory=dict)
+
+    _undo: list[tuple[list[Feature], dict]] = field(default_factory=list)
+    _redo: list[tuple[list[Feature], dict]] = field(default_factory=list)
+
+    # --- ink bookkeeping --------------------------------------------------- #
+    def new_ink(self, key: str, mask):
+        """The part of `mask` that has not already been built.
+
+        Also forgets any consumed ink that is no longer on the canvas, so the
+        Sketchpad's own bin icon and the eraser both just work: rub a shape out
+        and it stops being remembered.
+        """
+        import numpy as np
+        if mask is None:
+            self.consumed.pop(key, None)
+            return None
+        done = self.consumed.get(key)
+        if done is None or done.shape != mask.shape:
+            return mask
+        done = done & mask
+        self.consumed[key] = done
+        return mask & ~done
+
+    def retire_ink(self, key: str, mask) -> None:
+        """Everything currently on this canvas has now been dealt with."""
+        if mask is not None:
+            self.consumed[key] = mask.copy()
 
     # --- the step machine -------------------------------------------------- #
     def submit_profile(self, profile: Profile) -> Step:
@@ -45,10 +91,17 @@ class Session:
         return self.step
 
     def commit(self, depth: float = DEFAULT_DEPTH_MM, z_base: float = 0.0,
-               name: str | None = None) -> Feature:
+               name: str | None = None, kind: FeatureKind = FeatureKind.EXTRUDE,
+               axis: Axis | None = None, angle: float | None = None) -> Feature:
+        """Turn the pending profile into a feature.
+
+        `kind`/`axis`/`angle` were added on 29 Sep for revolve. They default to
+        a plain extrude, so every existing caller is unaffected.
+        """
         if self.pending_profile is None or self.pending_op is None:
             raise ValueError("Nothing to commit - draw a shape and pick add or cut.")
         self._snapshot()
+        extra = {} if angle is None else {"angle": float(angle)}
         feat = Feature(
             feature_id=uuid.uuid4().hex[:8],
             name=name or self._auto_name(self.pending_op),
@@ -56,6 +109,9 @@ class Session:
             profile=self.pending_profile,
             depth=float(depth),
             z_base=float(z_base),
+            kind=kind,
+            axis=axis,
+            **extra,
         )
         self.doc.add(feat)
         self.pending_profile = None
@@ -69,21 +125,32 @@ class Session:
 
     # --- history ----------------------------------------------------------- #
     def _snapshot(self) -> None:
-        self._undo.append(list(self.doc.features))
+        # The consumed-ink map travels with the feature list, so undoing a
+        # build makes its strokes count as new again and pressing Add re-adds
+        # them. Otherwise undo would leave a drawing on the canvas that the app
+        # refused to look at.
+        self._undo.append(self._state())
         self._redo.clear()
+
+    def _state(self) -> tuple:
+        return (list(self.doc.features), dict(self.consumed),
+                {k: list(v) for k, v in self.clicked.items()})
+
+    def _restore(self, state: tuple) -> None:
+        self.doc.features, self.consumed, self.clicked = state
 
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self._redo.append(list(self.doc.features))
-        self.doc.features = self._undo.pop()
+        self._redo.append(self._state())
+        self._restore(self._undo.pop())
         return True
 
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append(list(self.doc.features))
-        self.doc.features = self._redo.pop()
+        self._undo.append(self._state())
+        self._restore(self._redo.pop())
         return True
 
     # --- rebuild ----------------------------------------------------------- #

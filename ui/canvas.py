@@ -35,6 +35,15 @@ def _ink_mask(image) -> np.ndarray | None:
     Sketchpad's shape has changed across Gradio versions - sometimes a plain
     array, sometimes {'composite':..., 'layers':[...], 'background':...}. Handle
     all of them rather than pinning a version.
+
+    RETURNS None FOR ANYTHING IT CANNOT READ, and never raises. This function is
+    the first thing every canvas callback calls, and an exception here does not
+    just lose a drawing: Gradio leaves EVERY output of the failed event in its
+    pending state, so the canvas is left spinning on a loading animation that
+    only a different, successful click can clear. That was the hang. A Sketchpad
+    that has been written to programmatically and not drawn on since sends
+    {'background': None, 'layers': [], 'composite': None}, which is exactly the
+    shape that used to reach `arr < 128` as a 0-d object array holding None.
     """
     if image is None:
         return None
@@ -43,17 +52,22 @@ def _ink_mask(image) -> np.ndarray | None:
         layers = image.get("layers") or []
         arr = None
         for layer in layers:                       # prefer the ink layer
-            a = np.asarray(layer)
-            if a.size and a.ndim == 3 and a.shape[2] == 4 and a[..., 3].max() > 0:
+            a = np.asarray(layer) if layer is not None else None
+            if (a is not None and a.size and a.ndim == 3 and a.shape[2] == 4
+                    and a[..., 3].max() > 0):
                 arr = a
                 break
         if arr is None:
-            arr = np.asarray(image.get("composite") if image.get("composite") is not None
-                             else image.get("background"))
+            fallback = image.get("composite")
+            if fallback is None:
+                fallback = image.get("background")
+            arr = np.asarray(fallback) if fallback is not None else None
     else:
         arr = np.asarray(image)
 
-    if arr is None or arr.size == 0:
+    # `np.asarray(None)` is a 0-d OBJECT array, not None and not empty, so the
+    # dtype check is the one that actually catches an all-empty payload.
+    if arr is None or arr.size == 0 or arr.ndim < 2 or arr.dtype == object:
         return None
 
     if arr.ndim == 3 and arr.shape[2] == 4:
@@ -156,12 +170,17 @@ def _order_component(coords: np.ndarray) -> np.ndarray:
     return pts[path]
 
 
-def strokes_from_image(image) -> list[Stroke]:
-    """Sketchpad output -> ordered strokes in canvas pixel coordinates.
+def ink_mask(image) -> np.ndarray | None:
+    """Public name for the canvas -> boolean ink mask step.
 
-    Returns [] for a blank canvas. The caller must handle that.
+    Split out from `strokes_from_image` so the app can subtract the ink it has
+    already committed. See `Session.consumed`.
     """
-    mask = _ink_mask(image)
+    return _ink_mask(image)
+
+
+def strokes_from_mask(mask: np.ndarray | None) -> list[Stroke]:
+    """A boolean ink mask -> ordered strokes in canvas pixel coordinates."""
     if mask is None or not mask.any():
         return []
 
@@ -190,6 +209,14 @@ def strokes_from_image(image) -> list[Stroke]:
             strokes.append(Stroke(points=path))
 
     return strokes
+
+
+def strokes_from_image(image) -> list[Stroke]:
+    """Sketchpad output -> ordered strokes in canvas pixel coordinates.
+
+    Returns [] for a blank canvas. The caller must handle that.
+    """
+    return strokes_from_mask(_ink_mask(image))
 
 
 def strokes_from_json(payload: str) -> list[Stroke]:
@@ -240,4 +267,281 @@ def render_recognition(raw_mm, primitive, size=(CANVAS_W, CANVAS_H)):
         for p in pts[::max(1, len(pts) // 24)]:
             d.ellipse([p[0] - 2, p[1] - 2, p[0] + 2, p[1] + 2], fill="#2a6fdb")
 
+    return np.asarray(img)
+
+
+def render_half(raw_mm, segments, ring_mm, revolving: bool,
+                size=(CANVAS_W, CANVAS_H)):
+    """The half-mode counterpart of `render_recognition`.
+
+    Half mode used to return nothing at all to the preview panel, so "What did
+    I draw?" showed an empty box - the one place in the app where the user got
+    no feedback, and the place they most need it, because a half profile is the
+    hardest thing to picture the result of.
+
+    Four layers, back to front:
+
+      grey     the raw stroke, as drawn
+      blue     the FITTED half - straight where you meant straight, a true arc
+               where you meant an arc. This is what actually gets swept.
+      dots     the corners the fit found, so an unwanted one is visible
+      pale     the resulting silhouette: the full circle a revolve sweeps
+               through, or the mirrored outline an extrude produces
+    """
+    from PIL import Image, ImageDraw
+
+    from sketch2stl.strokes import mm_to_px
+
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+    for x in range(0, size[0], 40):
+        d.line([(x, 0), (x, size[1])], fill="#f0f0f0")
+    for y in range(0, size[1], 40):
+        d.line([(0, y), (size[0], y)], fill="#f0f0f0")
+
+    # The silhouette first, so the fitted line draws over it.
+    if ring_mm is not None and len(ring_mm) > 2:
+        px = [tuple(p) for p in mm_to_px(np.asarray(ring_mm, dtype=np.float64))]
+        if revolving:
+            # A revolve sweeps the half all the way round: the widest circle it
+            # passes through is the outline mirrored to the far side.
+            far = [(2 * AXIS_X_PX - x, y) for x, y in px]
+            d.polygon(px + far[::-1], fill="#eef1f8", outline="#ccd4e8")
+        else:
+            d.polygon(px, fill="#eef1f8", outline="#ccd4e8")
+
+    x = int(AXIS_X_PX)
+    for y in range(0, size[1], 16):
+        d.line([(x, y), (x, min(y + 9, size[1]))], fill=(120, 140, 200), width=2)
+
+    if raw_mm is not None and len(raw_mm) > 1:
+        d.line([tuple(p) for p in mm_to_px(np.asarray(raw_mm, dtype=np.float64))],
+               fill="#c9c9c9", width=5, joint="curve")
+
+    for seg in segments or ():
+        if len(seg.points) < 2:
+            continue
+        pts = [tuple(p) for p in mm_to_px(np.asarray(seg.points, dtype=np.float64))]
+        # Straight pieces and curved pieces in the same blue, but a LINE is drawn
+        # as the two endpoints only - that IS the claim being made about it.
+        d.line(pts, fill="#2a6fdb", width=3, joint="curve")
+        for end in (pts[0], pts[-1]):
+            d.ellipse([end[0] - 4, end[1] - 4, end[0] + 4, end[1] + 4],
+                      fill="#ffffff", outline="#2a6fdb", width=2)
+
+    label = ("blue = fitted half · pale = the circle it sweeps"
+             if revolving else "blue = fitted half · pale = mirrored outline")
+    d.text((8, 6), label, fill="#6b7280")
+    return np.asarray(img)
+
+
+# --------------------------------------------------------------------------- #
+# Half + centreline mode
+# --------------------------------------------------------------------------- #
+
+AXIS_X_PX = CANVAS_W / 2.0
+
+
+def centerline_axis():
+    """The drawn centreline, as an Axis in millimetres.
+
+    Fixed vertical through the middle of the canvas. Fixed rather than
+    user-placed on purpose: a drawn axis would need a second input mode and a
+    way to tell axis strokes from outline strokes, and the mode already gives
+    us the one thing that matters - the axis is KNOWN rather than inferred.
+
+    IT ALSO CARRIES THE VERTICAL DATUM. The axis runs from the BOTTOM of the
+    canvas UPWARD, so a point's distance along it is its height above the
+    canvas floor, and up on the screen is up in the model. Both halves of that
+    matter: the direction used to run downward, which quietly flipped every
+    revolve, and `kernel.half_to_radius_height` used to re-zero each profile to
+    its own lowest point, which put every revolve at z=0 no matter where it was
+    drawn. Together those made a cut drawn across the middle of a part come out
+    at the top of it.
+    """
+    from sketch2stl.strokes import px_to_mm
+    from sketch2stl.types import Axis
+    floor = px_to_mm(np.array([[AXIS_X_PX, CANVAS_H]]))[0]     # canvas bottom
+    top = px_to_mm(np.array([[AXIS_X_PX, 0.0]]))[0]
+    return Axis.from_points(floor, top)
+
+
+def centerline_background(size=(CANVAS_W, CANVAS_H)):
+    """A canvas background with the centreline drawn on it, for half mode."""
+    from PIL import Image, ImageDraw
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(img)
+    x = int(AXIS_X_PX)
+    for y in range(0, h, 16):                       # dashed
+        d.line([(x, y), (x, min(y + 9, h))], fill=(120, 140, 200), width=2)
+    d.text((x + 8, 6), "centreline - draw one half against this",
+           fill=(120, 140, 200))
+    return np.asarray(img)
+
+
+def blank_background(size=(CANVAS_W, CANVAS_H)):
+    from PIL import Image
+    return np.asarray(Image.new("RGB", size, "white"))
+
+
+def ghost_background(profiles, mode: str = "free", size=(CANVAS_W, CANVAS_H)):
+    """The canvas background: what is already built, drawn faintly underneath.
+
+    Added 29 Sep. Before this, the canvas was wiped blank after every feature,
+    so the second shape was drawn blind - the user had to guess where it would
+    land relative to the part they could see on the right. Now the committed
+    profiles are shown as a pale outline, so "a hole in the middle of that
+    plate" is something you can aim at instead of estimate.
+
+    This also fixes a real bug: returning None to a Gradio Sketchpad leaves it
+    spinning on a loading state forever. Returning a real image clears it.
+    """
+    from PIL import Image, ImageDraw
+    from sketch2stl.strokes import mm_to_px
+
+    w, h = size
+    img = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(img)
+
+    for prof in profiles or ():
+        try:
+            px = mm_to_px(np.asarray(prof.outer, dtype=np.float64))
+        except Exception:                                   # noqa: BLE001
+            continue
+        if len(px) < 3:
+            continue
+        pts = [(float(x), float(y)) for x, y in px]
+        # Pale fill plus a slightly stronger edge: enough to aim at, not enough
+        # to be mistaken for ink the recogniser will pick up.
+        d.polygon(pts, fill=(238, 240, 246), outline=(198, 205, 222))
+        for hole in getattr(prof, "holes", ()):  # inner rings punched back out
+            hpx = mm_to_px(np.asarray(hole, dtype=np.float64))
+            if len(hpx) >= 3:
+                d.polygon([(float(x), float(y)) for x, y in hpx],
+                          fill="white", outline=(198, 205, 222))
+
+    if mode == "half":
+        x = int(AXIS_X_PX)
+        for y in range(0, h, 16):
+            d.line([(x, y), (x, min(y + 9, h))], fill=(120, 140, 200), width=2)
+        d.text((x + 8, 6), "centreline", fill=(120, 140, 200))
+
+    return np.asarray(img)
+
+
+# --------------------------------------------------------------------------- #
+# The grid, and the fixed canvas backgrounds
+#
+# EVERY COLOUR IN HERE IS LIGHTER THAN 50% GREY ON PURPOSE. `_ink_mask`
+# thresholds at 128, so anything paler than that is invisible to the
+# recogniser - the grid can never be mistaken for a stroke. There is a test for
+# it, because getting this wrong would make the app hallucinate shapes on an
+# empty canvas.
+# --------------------------------------------------------------------------- #
+
+GRID_MINOR_MM = 5.0
+GRID_MAJOR_MM = 25.0
+GRID_MINOR = (238, 241, 246)
+GRID_MAJOR = (221, 227, 238)
+GRID_LABEL = (176, 185, 202)
+AXIS_COLOUR = (150, 165, 210)
+
+
+def _draw_grid(d, size=(CANVAS_W, CANVAS_H)) -> None:
+    """A millimetre grid with a label every major line.
+
+    The canvas has a fixed millimetres-per-pixel scale, so until now the size of
+    a drawn shape was pure guesswork - you found out it was 44 mm across after
+    you built it. With the grid you can draw a 40 mm circle on purpose.
+    """
+    from sketch2stl.config import PX_PER_MM
+    w, h = size
+    minor, major = GRID_MINOR_MM * PX_PER_MM, GRID_MAJOR_MM * PX_PER_MM
+
+    x = 0.0
+    while x <= w:
+        d.line([(x, 0), (x, h)], fill=GRID_MINOR, width=1)
+        x += minor
+    y = float(h)
+    while y >= 0:                      # from the BOTTOM: y=0 mm is the floor
+        d.line([(0, y), (w, y)], fill=GRID_MINOR, width=1)
+        y -= minor
+
+    x = 0.0
+    while x <= w:
+        d.line([(x, 0), (x, h)], fill=GRID_MAJOR, width=1)
+        d.text((x + 3, h - 13), f"{x / PX_PER_MM:.0f}", fill=GRID_LABEL)
+        x += major
+    y = float(h)
+    while y >= 0:
+        d.line([(0, y), (w, y)], fill=GRID_MAJOR, width=1)
+        if y < h - 1:
+            d.text((3, y + 2), f"{(h - y) / PX_PER_MM:.0f}", fill=GRID_LABEL)
+        y -= major
+    # Top-left, clear of the axis numbers, which collide with it along the
+    # bottom edge once the last major line is labelled.
+    d.text((5, 5), f"mm · grid {GRID_MINOR_MM:.0f}", fill=GRID_LABEL)
+
+
+def _draw_centreline(d, size=(CANVAS_W, CANVAS_H), label: str = "centreline") -> None:
+    w, h = size
+    x = int(AXIS_X_PX)
+    for y in range(0, h, 16):
+        d.line([(x, y), (x, min(y + 9, h))], fill=AXIS_COLOUR, width=2)
+    if label:
+        d.text((x + 8, 6), label, fill=AXIS_COLOUR)
+
+
+def grid_background(half: bool = False, size=(CANVAS_W, CANVAS_H)):
+    """The canvas image, set ONCE when the app is built and never replaced.
+
+    This is the whole reason the loading hang cannot come back: a Sketchpad that
+    is in no event's output list can never be put into a pending state by a
+    click. See the note on `Session.consumed` for how the ink is retired
+    without writing to the canvas.
+    """
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+    _draw_grid(d, size)
+    if half:
+        _draw_centreline(d, size)
+    return np.asarray(img)
+
+
+def render_clicks(points_px, closed: bool, half: bool,
+                  size=(CANVAS_W, CANVAS_H)):
+    """The click-to-place canvas: vertices dropped so far, joined up.
+
+    Freehand is the wrong tool for a shape made of straight edges - you cannot
+    draw a 40 mm line by hand, and the corner detector then has to recover what
+    you meant. Clicking the corners states it exactly, and the grid makes the
+    dimensions deliberate. Curves still want the pen.
+    """
+    from PIL import Image, ImageDraw
+    w, h = size
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+    _draw_grid(d, size)
+    if half:
+        _draw_centreline(d, size)
+
+    # `or ()` is wrong for a numpy array - truthiness on an array raises - and
+    # this is called with both a list of clicks and an (N, 2) array.
+    pts = ([] if points_px is None else
+           [(float(x), float(y)) for x, y in np.asarray(points_px).reshape(-1, 2)])
+    if len(pts) > 1:
+        ring = pts + [pts[0]] if closed else pts
+        if closed:
+            d.polygon(ring, fill=(238, 243, 252), outline=None)
+        d.line(ring, fill="#2a6fdb", width=3, joint="curve")
+    for i, (x, y) in enumerate(pts):
+        r = 5 if i else 7
+        d.ellipse([x - r, y - r, x + r, y + r], fill="#ffffff",
+                  outline="#2a6fdb", width=3 if i == 0 else 2)
+
+    if not pts:
+        d.text((14, 14), "Click a corner to start. Each click adds a point and "
+                         "joins it to the last.", fill=(120, 130, 150))
     return np.asarray(img)
