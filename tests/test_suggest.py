@@ -16,10 +16,25 @@ import pathlib
 import numpy as np
 import pytest
 
+from sketch2stl import suggest
 from sketch2stl.suggest import Suggestion, suggest_kind, suggest_op
 from sketch2stl.types import Axis, Op, Profile
 
 Y_AXIS = Axis.from_points([0.0, 0.0], [0.0, 1.0])
+
+
+@pytest.fixture(autouse=True)
+def _no_trained_model(monkeypatch):
+    """Pin the rules arm unless a test explicitly asks for the model.
+
+    Without this the whole file changes behaviour depending on whether somebody
+    has run scripts/train_addcut.py, so it passes on one laptop and fails on the
+    other. Which arm answers is a property of the deployment, not of the code
+    under test, so each test has to say which one it means.
+    """
+    stub = lambda *a, **k: None                      # noqa: E731 - a stand-in
+    stub.cache_clear = lambda: None
+    monkeypatch.setattr(suggest, "load_addcut_model", stub)
 
 
 def rect(cx, cy, w, h):
@@ -142,8 +157,6 @@ class FakeModel:
         return np.array([self.prob])
 
 
-from sketch2stl import suggest                                    # noqa: E402
-
 
 @pytest.fixture
 def learned(monkeypatch):
@@ -189,7 +202,8 @@ def test_a_broken_model_falls_back_instead_of_breaking_the_app(learned):
     assert sug.value == Op.CUT.value
 
 
-def test_a_model_trained_on_different_features_is_refused(tmp_path):
+def test_a_model_trained_on_different_features_is_refused(tmp_path, monkeypatch):
+    monkeypatch.undo()               # this one exercises the real loader
     """Silently scoring a stale feature order would give confident nonsense."""
     joblib = pytest.importorskip("joblib")
     joblib.dump({"model": FakeModel(), "classes": ["add", "cut"],
