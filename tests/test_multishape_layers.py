@@ -226,3 +226,61 @@ def test_unticked_uses_start_z():
     A.on_add(pad(plate), BLANK, 10.0, 0.0, s, on_top=False)
     A.on_add(pad(boss), BLANK, 5.0, 3.0, s, on_top=False)
     assert s.doc.features[1].z_base == 3.0
+
+
+# --------------------------------------------------------------- layer editing
+class _Sel:
+    def __init__(self, row): self.index = [row, 1]
+
+
+def _two_layer_session():
+    def plate(d): d.rectangle([140, 120, 500, 360], outline=(0, 0, 0, 255), width=3)
+    def hole(d): plate(d); d.ellipse([260, 180, 380, 300], outline=(0, 0, 0, 255), width=3)
+    s = Session()
+    A.on_add(pad(plate), BLANK, 10.0, 0.0, s, on_top=True)
+    A.on_cut(pad(hole), BLANK, 10.0, 0.0, s, on_top=True)
+    return s
+
+
+def test_layer_table_is_newest_on_top_and_click_selects_that_layer():
+    s = _two_layer_session()
+    t = A._layer_table(s)
+    assert list(t["Layer"]) == ["Cut 1", "Add 1"] and list(t["Op"]) == ["cut", "add"]
+    sel, name, op, depth, z, vis, note, _ = A.on_select_layer(s, _Sel(0))
+    assert name == "Cut 1" and op == A.OP_CUT and sel == s.doc.features[1].feature_id
+    assert A.on_select_layer(s, _Sel(1))[1] == "Add 1"
+
+
+def test_swap_cut_to_add_rename_and_change_numbers():
+    s = _two_layer_session()
+    v0 = s.solid()[0].volume
+    sel = s.doc.features[1].feature_id
+    A.on_layer_apply(sel, "Cut 1", A.OP_ADD, 5.0, 10.0, True, s)
+    assert s.doc.features[1].name == "Add 2"          # auto names follow the operation
+    s.undo()
+    A.on_layer_apply(sel, "Boss", A.OP_ADD, 5.0, 10.0, True, s)
+    f = s.doc.features[1]
+    assert (f.name, f.op, f.depth, f.z_base) == ("Boss", Op.ADD, 5.0, 10.0)
+    assert s.solid()[0].volume > v0
+    s.undo()
+    assert s.doc.features[1].op is Op.CUT
+
+
+def test_an_edit_that_breaks_the_part_is_rolled_back():
+    s = _two_layer_session()
+    out = A.on_layer_apply(s.doc.features[0].feature_id, "", A.OP_CUT, 10.0, 0.0, True, s)
+    assert s.doc.features[0].op is Op.ADD          # a part made only of cuts cannot be built
+    assert "Not changed" in out[2]
+
+
+def test_delete_and_move_layers():
+    s = _two_layer_session()
+    cut = s.doc.features[1].feature_id
+    out = A.on_layer_down(cut, s)                   # a cut below everything has nothing to cut
+    assert "Not changed" in out[2] and s.doc.features[1].feature_id == cut
+    assert "already at the bottom" in A.on_layer_down(s.doc.features[0].feature_id, s)[2]
+    s = _two_layer_session()
+    cut = s.doc.features[1].feature_id
+    A.on_layer_delete(cut, s)
+    assert [f.name for f in s.doc.features] == ["Add 1"]
+    assert "Click a layer" in A.on_layer_delete(None, s)[2]

@@ -33,6 +33,7 @@ Everything else on the page is an ordinary output and updates as usual.
 from __future__ import annotations
 
 import functools
+import re
 import os
 import tempfile
 import traceback
@@ -644,8 +645,128 @@ def on_export(state):
 
 
 # --------------------------------------------------------------------------- #
-# the layer list (read-only: what has been built, newest on top)
+# the layer panel: click a layer, change it, delete it, move it, Add <-> Cut
 # --------------------------------------------------------------------------- #
+# The list is a gr.Dataframe because its .select event says which ROW was
+# clicked - no choices to keep in sync (a Radio whose choices change is what
+# broke the first version). The feature list IS the model and the solid is
+# rebuilt from it, so an edit is just "replace that feature and rebuild"; if the
+# rebuild fails the edit is undone and the reason shown.
+LAYER_HEADERS = [" ", "Layer", "Op", "mm"]
+_ICON = {"extrude": "▭", "revolve": "◐", "mirror_extrude": "◫"}
+OP_ADD, OP_CUT = "Add", "Cut"
+
+
+def _layer_table(state):
+    """Newest on top, like Figma. Row i is feature n-1-i."""
+    import pandas as pd
+    session = _session(state)
+    rows = []
+    for f in reversed(session.doc.features):
+        name = f.name + ("  (hidden)" if not f.visible else "")
+        dep = "rev" if f.kind is FeatureKind.REVOLVE else f"{f.depth:g}"
+        rows.append([_ICON.get(f.kind.value, "▭"), name, "cut" if f.op is Op.CUT else "add", dep])
+    return pd.DataFrame(rows, columns=LAYER_HEADERS)
+
+
+def _feature(session: Session, fid):
+    for f in session.doc.features:
+        if f.feature_id == fid:
+            return f
+    return None
+
+
+_NO_SEL = "*Click a layer in the list to change it.*"
+
+
+def _editor(session: Session, fid):
+    """Values for the editor fields: (sel, name, op, depth, z, visible, note, sketch)."""
+    f = _feature(session, fid) if fid else None
+    sketch = render_sketch(session.doc.features, selected=f.feature_id if f else None)
+    if f is None:
+        return (None, "", OP_ADD, DEFAULT_DEPTH_MM, 0.0, True, _NO_SEL, sketch)
+    i = session.doc.features.index(f) + 1
+    how = "revolved - depth not used" if f.kind is FeatureKind.REVOLVE else "extruded"
+    note = f"Editing **{f.name}** (layer {i} of {len(session.doc.features)}, {how}) - orange in the clean sketch."
+    return (f.feature_id, f.name, OP_CUT if f.op is Op.CUT else OP_ADD,
+            float(f.depth), float(f.z_base), bool(f.visible), note, sketch)
+
+
+def on_select_layer(state, evt: gr.SelectData):
+    session = _session(state)
+    feats = session.doc.features
+    try:
+        row = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
+        fid = feats[len(feats) - 1 - int(row)].feature_id
+    except Exception:                                # noqa: BLE001 - empty table, stale click
+        fid = None
+    return _editor(session, fid)
+
+
+def _after_edit(session: Session, what: str, sel=None):
+    """Rebuild after an edit; undo it if the part can no longer be built."""
+    mesh, err = session.solid()
+    if mesh is None:
+        session.undo()
+        what = f"Not changed - {err}"
+    preview, rows, msg = _panels(session, what)
+    return preview, rows, msg, render_sketch(session.doc.features, selected=sel), gr.update(), session
+
+
+@build_cb
+def on_layer_apply(sel, name, op, depth, z_base, visible, state):
+    session = _session(state)
+    f = _feature(session, sel)
+    if f is None:
+        preview, rows, _ = _panels(session)
+        return preview, rows, "Click a layer in the list first.", gr.update(), gr.update(), session
+    new_op = Op.CUT if op == OP_CUT else Op.ADD
+    name = (name or "").strip() or f.name
+    if new_op is not f.op and name == f.name and re.fullmatch(r"(Add|Cut) \d+", name):
+        name = session._auto_name(new_op)          # "Cut 1" turned into an add becomes "Add 2"
+    session.edit_feature(sel, name=name, op=new_op, depth=max(0.1, float(depth or f.depth)),
+                         z_base=float(z_base or 0.0), visible=bool(visible))
+    return _after_edit(session, f"Updated **{name}**.", sel)
+
+
+@build_cb
+def on_layer_delete(sel, state):
+    session = _session(state)
+    f = _feature(session, sel)
+    if f is None:
+        preview, rows, _ = _panels(session)
+        return preview, rows, "Click a layer in the list first.", gr.update(), gr.update(), session
+    session.delete_feature(sel)
+    return _after_edit(session, f"Deleted **{f.name}** (Undo brings it back).")
+
+
+def _move(sel, state, delta: int, word: str):
+    session = _session(state)
+    f = _feature(session, sel)
+    if f is None:
+        preview, rows, _ = _panels(session)
+        return preview, rows, "Click a layer in the list first.", gr.update(), gr.update(), session
+    if not session.move_feature(sel, delta):
+        preview, rows, _ = _panels(session)
+        return preview, rows, f"**{f.name}** is already at the {word}.", gr.update(), gr.update(), session
+    return _after_edit(session, f"Moved **{f.name}** {'up' if delta > 0 else 'down'} - "
+                                f"layers build bottom to top.", sel)
+
+
+@build_cb
+def on_layer_up(sel, state):
+    return _move(sel, state, +1, "top")
+
+
+@build_cb
+def on_layer_down(sel, state):
+    return _move(sel, state, -1, "bottom")
+
+
+def refresh_editor(sel, state):
+    """After any change: the list, and the editor showing the (possibly gone) layer."""
+    session = _session(state)
+    return (_layer_table(session),) + _editor(session, sel)[:-1]
 BRUSH = gr.Brush(default_size=BRUSH_PX, colors=["#000000"],
                  default_color="#000000", color_mode="fixed")
 SHEET_W, SHEET_H = CANVAS_W / PX_PER_MM, CANVAS_H / PX_PER_MM
@@ -678,7 +799,14 @@ HEAD = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
         # which vanished on these light panels - the Depth box looked empty.
         "<script>(function(){var u=new URL(window.location.href);"
         "if(u.searchParams.get('__theme')!=='light'){u.searchParams.set('__theme','light');"
-        "window.location.replace(u.toString());}})();</script>")
+        "window.location.replace(u.toString());}})();</script>"
+        # ...and if the redirect cannot happen (an embedded frame), strip the
+        # class Gradio uses to switch to dark, now and whenever it comes back.
+        "<script>(function(){function f(){[document.documentElement,document.body]"
+        ".forEach(function(e){if(e&&e.classList.contains('dark'))e.classList.remove('dark');});"
+        "document.querySelectorAll('.dark').forEach(function(e){e.classList.remove('dark');});}"
+        "f();new MutationObserver(f).observe(document.documentElement,{attributes:true,subtree:true,"
+        "attributeFilter:['class']});})();</script>")
 
 CSS = """
 :root, .gradio-container, .dark, .dark .gradio-container { color-scheme: light; --s3-bg:#f5f5f5; --s3-panel:#ffffff; --s3-line:#e6e6e6;
@@ -727,6 +855,12 @@ CSS = """
 #layer-list .s3-tag.cut { background:#ffe9e3; color:#c4320a; }
 #layer-list .s3-dim { color:#4d4d4d; font-size:11px; }
 #layer-props { background:#fff !important; border:none !important; }
+#layer-table table { font-size:12px !important; color:#1e1e1e !important; }
+#layer-table, #layer-table * { font-family: Inter, ui-sans-serif, system-ui, sans-serif !important; }
+#layer-table .toolbar, #layer-table .header-row { display:none !important; }
+#layer-table th { background:#fafafa !important; color:#4d4d4d !important; font-weight:500 !important; }
+#layer-table td { cursor:pointer; padding:4px 6px !important; background:#fff !important; color:#1e1e1e !important; }
+#layer-table tr:hover td { background:#e5f4ff !important; }
 #layer-props > div, #layer-props .block { background:#fff !important; }
 .s3-status, .s3-status p { font-size:12px !important; line-height:1.45 !important; }
 .s3-status strong { font-weight:600; }
@@ -747,7 +881,14 @@ _TEXT = dict(body_text_color="#1e1e1e", body_text_color_subdued="#4d4d4d",
              accordion_text_color="#1e1e1e", table_text_color="#1e1e1e",
              body_background_fill="#f5f5f5", block_background_fill="#ffffff",
              input_background_fill="#f5f5f5")
-THEME = gr.themes.Base().set(**_TEXT, **{k + "_dark": v for k, v in _TEXT.items()})
+THEME = gr.themes.Base().set(**_TEXT)
+# LIGHT ONLY. Every dark-mode value is overwritten with its light one, so even if
+# Gradio switches to dark (dark-mode browser, Colab, an old link without
+# ?__theme=light) nothing on the page changes colour.
+for _k in [k for k in vars(THEME) if k.endswith("_dark")]:
+    _light = getattr(THEME, _k[:-5], None)
+    if isinstance(_light, str):
+        setattr(THEME, _k, _light)
 
 with gr.Blocks(title="Sketch3D") as demo:
     session = gr.State()          # filled by _session() on first use
@@ -765,11 +906,31 @@ with gr.Blocks(title="Sketch3D") as demo:
     with gr.Row(equal_height=False):
         # ------------------------------------------------------------ LAYERS
         with gr.Column(scale=2, min_width=220, elem_classes="s3-panel"):
-            gr.HTML("<div class='s3-h'>Layers <span>· what you have built, in order</span></div>")
-            layer_list = gr.HTML(_layer_html(Session()), elem_id="layer-list")
+            gr.HTML("<div class='s3-h'>Layers <span>· newest on top · click one to edit</span></div>")
+            sel_id = gr.State()
+            layer_table = gr.Dataframe(value=_layer_table(Session()), headers=LAYER_HEADERS,
+                                       interactive=False, show_label=False, label=None,
+                                       elem_id="layer-table", wrap=True)
             with gr.Row():
                 undo_btn = gr.Button("Undo", size="sm")
                 clear_btn = gr.Button("Start over", size="sm")
+
+            gr.HTML("<div class='s3-h' style='margin-top:14px'>Selected layer</div>")
+            ed_note = gr.Markdown(_NO_SEL, elem_classes="s3-status")
+            ed_name = gr.Textbox(label="Name", max_lines=1)
+            ed_op = gr.Radio([OP_ADD, OP_CUT], value=OP_ADD, label="Operation", interactive=True)
+            with gr.Row():
+                ed_depth = gr.Number(value=DEFAULT_DEPTH_MM, label="Depth (mm)", precision=2,
+                                     min_width=80, interactive=True)
+                ed_z = gr.Number(value=0.0, label="Start z (mm)", precision=2, min_width=80,
+                                 interactive=True)
+            ed_vis = gr.Checkbox(True, label="Visible", interactive=True)
+            with gr.Row():
+                apply_btn = gr.Button("Apply", variant="primary", size="sm")
+                del_btn = gr.Button("Delete", variant="stop", size="sm")
+            with gr.Row():
+                up_btn = gr.Button("▲ Move up", size="sm")
+                down_btn = gr.Button("▼ Move down", size="sm")
             gr.HTML("<div class='s3-h' style='margin-top:14px'>3D preview</div>")
             preview = gr.Model3D(height=260, label=None, show_label=False,
                                  clear_color=(0.96, 0.96, 0.96, 1.0), camera_position=(-60, 55, 210))
@@ -846,7 +1007,14 @@ every edit, so editing an old layer, hiding it or reordering it just rebuilds.
 
     preview_btn.click(on_preview, pads + [session, mode, style, build_as, make_sym],
                       [layers, status, recognised, session])
-    relist = dict(fn=_layer_html, inputs=[session], outputs=[layer_list])
+    editor = [sel_id, ed_name, ed_op, ed_depth, ed_z, ed_vis, ed_note]
+    relist = dict(fn=refresh_editor, inputs=[sel_id, session], outputs=[layer_table] + editor)
+    layer_table.select(on_select_layer, [session], editor + [recognised])
+    apply_btn.click(on_layer_apply, [sel_id, ed_name, ed_op, ed_depth, ed_z, ed_vis, session],
+                    outs).then(**relist)
+    del_btn.click(on_layer_delete, [sel_id, session], outs).then(**relist)
+    up_btn.click(on_layer_up, [sel_id, session], outs).then(**relist)
+    down_btn.click(on_layer_down, [sel_id, session], outs).then(**relist)
     add_btn.click(on_add, pads + [depth, z_base, session, mode, style, build_as, make_sym, on_top],
                   outs).then(**relist)
     cut_btn.click(on_cut, pads + [depth, z_base, session, mode, style, build_as, make_sym, on_top],

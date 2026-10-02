@@ -309,8 +309,8 @@ def render_sketch(built, current=(), raw_mm=(), selected: str | None = None,
             d.line(outer + outer[:1], fill="#d9d9d9", width=1)
             continue
         if f.op is Op.CUT:
-            d.polygon(outer, fill="#ffffff")
-            d.line(outer + outer[:1], fill="#e8590c" if sel else "#d9480f", width=3 if sel else 2)
+            d.polygon(outer, fill="#fff4e6" if sel else "#ffffff")
+            d.line(outer + outer[:1], fill="#f59f00" if sel else "#d9480f", width=4 if sel else 2)
         else:
             d.polygon(outer, fill="#ffe8cc" if sel else "#e9ecef")
             for h in f.profile.holes:
