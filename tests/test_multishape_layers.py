@@ -199,3 +199,30 @@ def test_hybrid_takes_the_circle_fit_when_ml_says_polyline():
     assert h.recognize(Stroke(points=quad)).kind is PrimitiveKind.POLYLINE   # 4 corners: not a circle
     h = HybridRecognizer(Always(PrimitiveKind.ARC), Always(PrimitiveKind.CIRCLE))
     assert h.recognize(Stroke(points=np.zeros((10, 2)))).kind is PrimitiveKind.ARC
+
+
+# --------------------------------------------------------------- stacking
+def test_build_on_top_stacks_adds_and_cuts_down_from_the_top():
+    def plate(d): d.rectangle([140, 120, 500, 360], outline=(0, 0, 0, 255), width=3)
+    def boss(d): plate(d); d.ellipse([260, 180, 380, 300], outline=(0, 0, 0, 255), width=3)
+    def pocket(d): boss(d); d.rectangle([160, 140, 220, 200], outline=(0, 0, 0, 255), width=3)
+    def beside(d): pocket(d); d.ellipse([540, 60, 600, 120], outline=(0, 0, 0, 255), width=3)
+    s = Session()
+    A.on_add(pad(plate), BLANK, 10.0, 0.0, s, on_top=True)
+    A.on_add(pad(boss), BLANK, 5.0, 0.0, s, on_top=True)            # circle ON the plate
+    assert s.doc.features[1].z_base == 10.0
+    A.on_cut(pad(pocket), BLANK, 4.0, 0.0, s, on_top=True)          # pocket INTO the plate
+    assert s.doc.features[2].z_base == 6.0
+    A.on_add(pad(beside), BLANK, 8.0, 0.0, s, on_top=True)          # off the part: on the table
+    assert s.doc.features[3].z_base == 0.0
+    mesh, _ = s.solid()
+    assert abs(mesh.bounds[1][2] - 15.0) < 1e-6
+
+
+def test_unticked_uses_start_z():
+    def plate(d): d.rectangle([140, 120, 500, 360], outline=(0, 0, 0, 255), width=3)
+    def boss(d): plate(d); d.ellipse([260, 180, 380, 300], outline=(0, 0, 0, 255), width=3)
+    s = Session()
+    A.on_add(pad(plate), BLANK, 10.0, 0.0, s, on_top=False)
+    A.on_add(pad(boss), BLANK, 5.0, 3.0, s, on_top=False)
+    assert s.doc.features[1].z_base == 3.0

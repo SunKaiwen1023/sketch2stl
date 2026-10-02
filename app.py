@@ -401,8 +401,38 @@ def _symmetry(profiles, make_sym: bool):
 # --------------------------------------------------------------------------- #
 # callbacks
 # --------------------------------------------------------------------------- #
+def _top_under(session: Session, profiles) -> float:
+    """Height of the part's top surface under the new shape(s), in mm.
+
+    Only layers that ADD material and overlap the new outline count, so a shape
+    drawn beside the part still starts on the table (0) and a shape drawn on top
+    of it starts on its top face. Revolved layers have no simple top, so if one
+    is involved the whole part's height is used.
+    """
+    from shapely.geometry import Polygon
+    try:
+        new = [Polygon(p.outer).buffer(0) for p in profiles]
+    except Exception:                                # noqa: BLE001
+        return 0.0
+    top = 0.0
+    for f in session.doc.features:
+        if f.op is not Op.ADD or not f.visible:
+            continue
+        if f.kind is FeatureKind.REVOLVE:
+            mesh, _ = session.solid()
+            return float(mesh.bounds[1][2]) if mesh is not None else top
+        try:
+            old = Polygon(f.profile.outer).buffer(0)
+        except Exception:                            # noqa: BLE001
+            continue
+        if any(n.intersection(old).area > 1.0 for n in new):
+            top = max(top, float(f.z_base) + float(f.depth))
+    return top
+
+
 def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
-            mode: str, style: str, build_as: str, make_sym: bool = False):
+            mode: str, style: str, build_as: str, make_sym: bool = False,
+            on_top: bool = False):
     key = _canvas_key(mode, style)
     profiles, note, shot, extra = _read(pad_free, pad_half, session, mode, style,
                                         build_as, make_sym)
@@ -411,6 +441,12 @@ def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
         return prev, rows, note, shot, gr.update(), session
 
     revolving = mode == HALF_MODE and (extra or {}).get("revolving", build_as == REVOLVE_AS)
+    if on_top and not revolving:
+        # STACK ON THE PART. Start z used to default to 0, so a circle drawn on
+        # top of a plate and added at z=0 just merged into the plate - nothing
+        # visible happened. Add now sits on the top face; Cut goes down from it.
+        top = _top_under(session, profiles)
+        z_base = top if op is Op.ADD else max(0.0, top - float(depth))
     kwargs = ({"kind": FeatureKind.REVOLVE, "axis": centerline_axis()}
               if revolving else {})
     try:
@@ -492,16 +528,16 @@ def on_preview(pad_free, pad_half, state, mode=FREE_MODE, style=FREEHAND,
 
 @build_cb
 def on_add(pad_free, pad_half, depth, z_base, state, mode=FREE_MODE,
-           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False):
+           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False, on_top=False):
     return _commit(pad_free, pad_half, depth, z_base, Op.ADD, _session(state),
-                   mode, style, build_as, make_sym)
+                   mode, style, build_as, make_sym, on_top)
 
 
 @build_cb
 def on_cut(pad_free, pad_half, depth, z_base, state, mode=FREE_MODE,
-           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False):
+           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False, on_top=False):
     return _commit(pad_free, pad_half, depth, z_base, Op.CUT, _session(state),
-                   mode, style, build_as, make_sym)
+                   mode, style, build_as, make_sym, on_top)
 
 
 @build_cb
@@ -701,6 +737,18 @@ CSS = """
 footer { display:none !important; }
 """
 
+# Text colours set in the THEME, not only in CSS. Gradio's own greys (help text
+# under a checkbox, labels, Markdown) come from these variables, and in Colab
+# several of them were light grey on white - unreadable. Dark variants set to the
+# same values so a dark-mode browser cannot turn them white either.
+_TEXT = dict(body_text_color="#1e1e1e", body_text_color_subdued="#4d4d4d",
+             block_info_text_color="#4d4d4d", block_label_text_color="#1e1e1e",
+             block_title_text_color="#1e1e1e", checkbox_label_text_color="#1e1e1e",
+             accordion_text_color="#1e1e1e", table_text_color="#1e1e1e",
+             body_background_fill="#f5f5f5", block_background_fill="#ffffff",
+             input_background_fill="#f5f5f5")
+THEME = gr.themes.Base().set(**_TEXT, **{k + "_dark": v for k, v in _TEXT.items()})
+
 with gr.Blocks(title="Sketch3D") as demo:
     session = gr.State()          # filled by _session() on first use
 
@@ -723,7 +771,8 @@ with gr.Blocks(title="Sketch3D") as demo:
                 undo_btn = gr.Button("Undo", size="sm")
                 clear_btn = gr.Button("Start over", size="sm")
             gr.HTML("<div class='s3-h' style='margin-top:14px'>3D preview</div>")
-            preview = gr.Model3D(height=260, label=None, show_label=False)
+            preview = gr.Model3D(height=260, label=None, show_label=False,
+                                 clear_color=(0.96, 0.96, 0.96, 1.0), camera_position=(-60, 55, 210))
 
         # ------------------------------------------------------------ CANVAS
         with gr.Column(scale=6, min_width=520, elem_id="s3-canvas"):
@@ -761,6 +810,9 @@ with gr.Blocks(title="Sketch3D") as demo:
                 label="Half becomes",
                 info="ML2 decides by default and says how sure it is - pick one to override.")
             make_sym = gr.Checkbox(False, label="Make symmetric")
+            on_top = gr.Checkbox(True, label="Build on top of the part",
+                                 info="Add sits on the part's top face, Cut goes down from it. "
+                                      "Untick to set Start z yourself.")
             with gr.Row():
                 depth = gr.Number(value=DEFAULT_DEPTH_MM, label="Depth (mm)", precision=2, min_width=90)
                 z_base = gr.Number(value=0.0, label="Start z (mm)", precision=2, min_width=90)
@@ -795,9 +847,9 @@ every edit, so editing an old layer, hiding it or reordering it just rebuilds.
     preview_btn.click(on_preview, pads + [session, mode, style, build_as, make_sym],
                       [layers, status, recognised, session])
     relist = dict(fn=_layer_html, inputs=[session], outputs=[layer_list])
-    add_btn.click(on_add, pads + [depth, z_base, session, mode, style, build_as, make_sym],
+    add_btn.click(on_add, pads + [depth, z_base, session, mode, style, build_as, make_sym, on_top],
                   outs).then(**relist)
-    cut_btn.click(on_cut, pads + [depth, z_base, session, mode, style, build_as, make_sym],
+    cut_btn.click(on_cut, pads + [depth, z_base, session, mode, style, build_as, make_sym, on_top],
                   outs).then(**relist)
     undo_btn.click(on_undo, [session, mode, style], outs).then(**relist)
     clear_btn.click(on_clear, pads + [session, mode, style], outs).then(**relist)
@@ -816,7 +868,7 @@ every edit, so editing an old layer, hiding it or reordering it just rebuilds.
 def launch(**kwargs):
     """Launch with the Figma-like styling. In Gradio 6 `css`/`theme` go to launch()."""
     try:
-        return demo.launch(css=CSS, theme=gr.themes.Base(), head=HEAD, **kwargs)
+        return demo.launch(css=CSS, theme=THEME, head=HEAD, **kwargs)
     except TypeError:                                 # older Gradio: no css/theme here
         return demo.launch(**kwargs)
 
