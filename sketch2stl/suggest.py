@@ -249,6 +249,51 @@ def _suggest_op_ml(new: Polygon, others: list[Polygon], profile: Profile,
 # EXTRUDE or REVOLVE
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# ML2: revolve or mirror-extrude (fine-tuned ResNet-18, ONNX)
+# --------------------------------------------------------------------------- #
+# Trained in notebooks/ML2_revolve_or_mirror.ipynb, published at
+# huggingface.co/pakiino/sketch2stl-revolve-or-mirror. The app fetches it at
+# startup (sketch2stl/hub.py); absent, everything falls back to the rule below.
+KIND_PATH = os.environ.get("KIND_PATH", "models/revolve_or_mirror")
+
+
+@lru_cache(maxsize=1)
+def load_kind_model(path: str = KIND_PATH):
+    """(onnx session, mean, std) or None. Silent when absent - that is normal."""
+    f = Path(path) / "revolve_or_mirror.onnx"
+    if not f.exists():
+        return None
+    import json
+    import onnxruntime as ort
+    meta = json.loads((Path(path) / "meta.json").read_text())
+    mean = np.asarray(meta["mean"], np.float32).reshape(3, 1, 1)
+    std = np.asarray(meta["std"], np.float32).reshape(3, 1, 1)
+    return ort.InferenceSession(str(f), providers=["CPUExecutionProvider"]), mean, std
+
+
+def kind_arm(path: str = KIND_PATH) -> str:
+    """One line for the app header: which revolve/mirror suggester is live."""
+    try:
+        return ("ML2 - fine-tuned ResNet-18 (" + path + ")" if load_kind_model(path)
+                else "geometric rule (no ML2 model found)")
+    except Exception as exc:                         # noqa: BLE001
+        return f"geometric rule (ML2 at {path} would not load: {exc})"
+
+
+def _suggest_kind_ml(half_points: np.ndarray, axis: Axis, model) -> Suggestion:
+    from .ml2_render import render, shape_from_drawing
+    sess, mean, std = model
+    img = render(shape_from_drawing(half_points, axis.point, axis.direction))
+    x = ((img.astype(np.float32) / 255.0 - mean) / std)[None].astype(np.float32)
+    p_mirror, p_revolve = (float(v) for v in sess.run(None, {"image": x})[0][0])
+    if p_revolve >= p_mirror:
+        return Suggestion("revolve", p_revolve,
+                          f"ML2 reads this half as a turned part ({p_revolve:.0%}).", source="ml")
+    return Suggestion("extrude", p_mirror,
+                      f"ML2 reads this half as a flat mirrored part ({p_mirror:.0%}).", source="ml")
+
+
 def suggest_kind(half_points: np.ndarray, axis: Axis) -> Suggestion:
     """In half mode: does this half want to be spun, or mirrored and extruded?
 
@@ -261,6 +306,16 @@ def suggest_kind(half_points: np.ndarray, axis: Axis) -> Suggestion:
     pts = np.asarray(half_points, dtype=np.float64).reshape(-1, 2)
     if len(pts) < 4:
         return Suggestion("extrude", 0.5, "Too few points to tell.")
+
+    try:
+        model = load_kind_model()
+    except Exception:                                # noqa: BLE001 - never break the app
+        model = None
+    if model is not None:
+        try:
+            return _suggest_kind_ml(pts, axis, model)
+        except Exception:                            # noqa: BLE001
+            pass                                     # fall through to the rule
 
     # Straightness: how far the outline strays from its own chords.
     from .corners import find_corners, turning_angles

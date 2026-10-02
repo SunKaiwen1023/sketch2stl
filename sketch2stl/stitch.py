@@ -128,6 +128,73 @@ def stitch(strokes: list[np.ndarray], tol: float | None = None) -> Contour:
     return Contour(path, closed, tuple(seams), len(order))
 
 
+def stitch_all(strokes: list[np.ndarray], tol: float | None = None) -> list[Contour]:
+    """Several separate outlines drawn in one go -> one Contour EACH.
+
+    `stitch` builds ONE path and silently drops every stroke it cannot reach, so
+    a plate drawn together with the two holes inside it came back as just one of
+    the three. This keeps going: chain strokes into a shape until it closes or
+    nothing is near enough, then start a new shape from whatever is left.
+
+    Two differences from `stitch`, both because shapes are now neighbours:
+      * a chain STOPS as soon as it closes, so a finished circle never grabs
+        the stroke next to it;
+      * the join tolerance grows with the shape being built, not with the whole
+        drawing, so a big outline does not swallow a small hole beside it.
+    """
+    pieces = [np.asarray(s, dtype=np.float64).reshape(-1, 2)
+              for s in strokes if len(np.asarray(s).reshape(-1, 2)) >= 2]
+    out: list[Contour] = []
+    remaining = list(range(len(pieces)))
+    while remaining:
+        first = remaining.pop(0)
+        path = pieces[first].copy()
+        seams: list[int] = []
+        n = 1
+
+        def limit(p):
+            if tol is not None:
+                return tol
+            return max(STROKE_JOIN_MM, STROKE_JOIN_FRACTION * float(arc_length(p)[-1]))
+
+        while remaining and not (n > 1 and _meets(path[0], path[-1], limit(path))):
+            if n == 1 and _meets(path[0], path[-1], limit(path)) and len(path) > 8:
+                break                                   # a single stroke that already closes
+            tail, best = path[-1], None
+            for idx in remaining:
+                a, b = _ends(pieces[idx])
+                for flipped, end in ((False, a), (True, b)):
+                    d = float(np.linalg.norm(end - tail))
+                    if best is None or d < best[0]:
+                        best = (d, idx, flipped)
+            # also allow growing at the HEAD, so stroke order on the canvas does not matter
+            head = path[0]
+            for idx in remaining:
+                a, b = _ends(pieces[idx])
+                for flipped, end in ((True, a), (False, b)):
+                    d = float(np.linalg.norm(end - head))
+                    if d < best[0]:
+                        best = (d, idx, flipped, "head")
+            if best[0] > limit(np.vstack([path, pieces[best[1]]])):
+                break
+            idx, flipped = best[1], best[2]
+            remaining.remove(idx)
+            nxt = pieces[idx][::-1] if flipped else pieces[idx]
+            if len(best) == 4:                          # prepend
+                seams = [k + len(nxt) for k in seams] + [len(nxt) - 1]
+                path = np.vstack([nxt, path])
+            else:
+                seams.append(len(path) - 1)
+                path = np.vstack([path, nxt])
+            n += 1
+        closed = _meets(path[0], path[-1], limit(path))
+        if closed and n > 1 and np.linalg.norm(path[0] - path[-1]) > 1e-9:
+            seams.append(len(path) - 1)
+            path = np.vstack([path, path[:1]])
+        out.append(Contour(path, closed, tuple(seams), n))
+    return out
+
+
 def _meets(a: np.ndarray, b: np.ndarray, tol: float) -> bool:
     return bool(np.linalg.norm(np.asarray(a) - np.asarray(b)) <= tol)
 

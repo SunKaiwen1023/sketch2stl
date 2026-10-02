@@ -35,6 +35,7 @@ def _no_trained_model(monkeypatch):
     stub = lambda *a, **k: None                      # noqa: E731 - a stand-in
     stub.cache_clear = lambda: None
     monkeypatch.setattr(suggest, "load_addcut_model", stub)
+    monkeypatch.setattr(suggest, "load_kind_model", stub)
 
 
 def rect(cx, cy, w, h):

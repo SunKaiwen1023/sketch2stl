@@ -119,6 +119,57 @@ class Session:
         self.step = "draw"
         return feat
 
+    def commit_many(self, profiles: list[Profile], op: Op, depth: float = DEFAULT_DEPTH_MM,
+                    z_base: float = 0.0, kind: FeatureKind = FeatureKind.EXTRUDE,
+                    axis: Axis | None = None) -> list[Feature]:
+        """Several shapes drawn in one go -> several features, ONE undo step."""
+        if not profiles:
+            raise ValueError("Nothing to commit - draw a shape first.")
+        self._snapshot()
+        made = []
+        for prof in profiles:
+            feat = Feature(feature_id=uuid.uuid4().hex[:8], name=self._auto_name(op), op=op,
+                           profile=prof, depth=float(depth), z_base=float(z_base),
+                           kind=kind, axis=axis)
+            self.doc.add(feat)
+            made.append(feat)
+        self.pending_profile = self.pending_op = None
+        self.step = "draw"
+        return made
+
+    # --- the layer panel: edit any feature, not just the last ---------------- #
+    # The feature list IS the model and the solid is rebuilt from it every time,
+    # so editing an old layer is just replacing it in the list. Each edit is one
+    # undo step.
+    def _index(self, feature_id: str) -> int:
+        for i, f in enumerate(self.doc.features):
+            if f.feature_id == feature_id:
+                return i
+        raise KeyError(feature_id)
+
+    def edit_feature(self, feature_id: str, **changes) -> Feature:
+        from dataclasses import replace
+        i = self._index(feature_id)
+        new = replace(self.doc.features[i], **changes)
+        self._snapshot()
+        feats = list(self.doc.features); feats[i] = new; self.doc.features = feats
+        return new
+
+    def delete_feature(self, feature_id: str) -> None:
+        self._index(feature_id)
+        self._snapshot()
+        self.doc.features = [f for f in self.doc.features if f.feature_id != feature_id]
+
+    def move_feature(self, feature_id: str, delta: int) -> bool:
+        i = self._index(feature_id)
+        j = i + delta
+        if not 0 <= j < len(self.doc.features):
+            return False
+        self._snapshot()
+        feats = list(self.doc.features); feats[i], feats[j] = feats[j], feats[i]
+        self.doc.features = feats
+        return True
+
     def _auto_name(self, op: Op) -> str:
         n = sum(1 for f in self.doc.features if f.op is op) + 1
         return f"{'Add' if op is Op.ADD else 'Cut'} {n}"

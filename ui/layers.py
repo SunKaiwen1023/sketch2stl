@@ -42,6 +42,12 @@ def to_rows(doc: Document) -> list[list]:
     return rows
 
 
-# TODO (PK): let the user click a row to edit its depth, and re-run build().
-# Because build() is a pure function of the feature list, editing a depth and
-# rebuilding is already correct - it just needs wiring.
+def choices(doc: Document) -> list[tuple[str, str]]:
+    """(label, feature_id) pairs for the layer picker, newest on top like Figma."""
+    out = []
+    for i, f in reversed(list(enumerate(doc.features))):
+        icon = {"extrude": "▭", "revolve": "◐", "mirror_extrude": "◫"}.get(f.kind.value, "▭")
+        eye = "" if f.visible else "   (hidden)"
+        tag = "cut" if f.op.value == "cut" else "add"
+        out.append((f"{icon}  {f.name}   ·  {tag}{eye}", f.feature_id))
+    return out

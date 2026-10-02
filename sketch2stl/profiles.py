@@ -220,3 +220,40 @@ def fold_to_one_side(points: np.ndarray, axis) -> np.ndarray:
     n = np.array([d[1], -d[0]])
     out[wrong] = pts[wrong] - perp[wrong, None] * n
     return out
+
+
+def nest_profiles(profiles: list[Profile]) -> list[Profile]:
+    """Several closed outlines drawn together -> solids with their holes.
+
+    An outline inside another outline is a hole in it; an outline inside a hole
+    is an island again (even depth = material, odd depth = hole). So a plate drawn
+    with two circles inside it comes back as ONE profile with two holes, which is
+    what anyone drawing that meant - not three separate solids stacked on top of
+    each other.
+
+    Outlines that are not inside anything stay separate profiles.
+    """
+    if len(profiles) <= 1:
+        return list(profiles)
+    polys = [Polygon(pr.outer, [h for h in pr.holes]).buffer(0) for pr in profiles]
+    order = sorted(range(len(polys)), key=lambda i: polys[i].area, reverse=True)
+    parent, depth = {}, {}
+    for k, i in enumerate(order):
+        rp = polys[i].representative_point()
+        parent[i] = None
+        for j in reversed(order[:k]):                 # smallest bigger outline first
+            if polys[j].contains(rp) and polys[j].area > polys[i].area:
+                parent[i] = j
+                break
+        depth[i] = 0 if parent[i] is None else depth[parent[i]] + 1
+    out = []
+    for i in order:
+        if depth[i] % 2:
+            continue                                   # a hole - handled by its parent
+        g = polys[i]
+        for c in order:
+            if parent.get(c) == i:
+                g = g.difference(polys[c])
+        parts = [g] if g.geom_type == "Polygon" else [x for x in getattr(g, "geoms", []) if x.geom_type == "Polygon"]
+        out += [polygon_to_profile(x) for x in parts if x.area > 0]
+    return out

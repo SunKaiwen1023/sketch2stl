@@ -46,18 +46,21 @@ from sketch2stl.config import (BRUSH_PX, CANVAS_H, CANVAS_W, DEFAULT_DEPTH_MM,
 from sketch2stl.corners import Segment, polyline_from_segments, segment_stroke
 from sketch2stl.exporter import check, export_stl
 from sketch2stl.kernel import stats
+from sketch2stl.hub import fetch_models
 from sketch2stl.profiles import (close_to_axis, fold_to_one_side, mirror_half,
-                                 profile_area, profile_from_points,
+                                 nest_profiles, profile_area, profile_from_points,
                                  profile_from_primitive)
 from sketch2stl.recognizer import RuleRecognizer
 from sketch2stl.recognizer.ml import MLRecognizer
 from sketch2stl.session import Session
-from sketch2stl.stitch import smooth_seams, stitch
-from sketch2stl.suggest import addcut_arm, suggest_kind, suggest_op
+from sketch2stl.stitch import smooth_seams, stitch, stitch_all
+from sketch2stl.suggest import addcut_arm, kind_arm, suggest_kind, suggest_op
+from sketch2stl.symmetry import find_symmetry, symmetrize
 from sketch2stl.types import FeatureKind, Op, PrimitiveKind, Stroke
 from ui.canvas import (centerline_axis, grid_background, ink_mask, render_clicks,
-                       render_half, render_recognition, strokes_from_mask)
-from ui.layers import HEADERS, to_rows
+                       render_half, render_recognition, render_sketch,
+                       strokes_from_mask)
+from ui.layers import HEADERS, choices, to_rows
 from ui.preview import mesh_to_preview_file
 
 FREE_MODE = "Free draw"
@@ -68,8 +71,13 @@ CLICK = "Click the corners"
 
 EXTRUDE_AS = "Extrude (mirror the half into a block)"
 REVOLVE_AS = "Revolve (spin the half around the centreline)"
+AUTO_AS = "Let ML2 decide (you can override)"
 
 RECOGNIZER_PATH = os.environ.get("RECOGNIZER_PATH", "models/recognizer")
+
+# Weights are never committed, so a fresh clone fetches them from the Hub once.
+for _line in fetch_models(RECOGNIZER_PATH):
+    print(f"models:          {_line}")
 
 if (Path(RECOGNIZER_PATH) / "model.joblib").exists():
     RECOGNIZER = MLRecognizer(RECOGNIZER_PATH)
@@ -79,9 +87,11 @@ else:
     ARM = "rules baseline (no trained model found - see scripts/train_recognizer.py)"
 
 OP_ARM = addcut_arm()
+KIND_ARM = kind_arm()
 
 print(f"recogniser:      {ARM}")
 print(f"add/cut guess:   {OP_ARM}")
+print(f"revolve/mirror:  {KIND_ARM}")
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +229,7 @@ def _line_segments(points: np.ndarray) -> list[Segment]:
 
 
 def _read(pad_free, pad_half, session: Session, mode: str, style: str,
-          build_as: str):
+          build_as: str, make_sym: bool = False):
     """The active surface -> (profile, description, preview_image, half_points).
 
     STITCHING (freehand). The canvas returns one entry per connected ink
@@ -267,7 +277,19 @@ def _read(pad_free, pad_half, session: Session, mode: str, style: str,
                 segments, fitted = [], raw
         half = fold_to_one_side(fitted, axis)
 
-        revolving = build_as == REVOLVE_AS
+        # ML2 DECIDES unless the person already has. Showing its guess as a line
+        # of text and then building whatever the radio said made the model
+        # invisible: nothing it said ever changed the part.
+        sug = suggest_kind(half, axis)
+        if build_as == AUTO_AS:
+            revolving = sug.value == "revolve"
+            who = (f"**ML2 chose: {'Revolve' if revolving else 'Mirror + extrude'}** "
+                   f"({sug.confidence:.0%})" + (" - not sure, check the 3D preview or pick "
+                   "one above" if sug.unsure else " - pick the other option above to override"))
+        else:
+            revolving = build_as == REVOLVE_AS
+            who = (f"You chose {'Revolve' if revolving else 'Mirror + extrude'}; ML2 would say "
+                   f"{'Revolve' if sug.value == 'revolve' else 'Mirror + extrude'} ({sug.confidence:.0%})")
         ring = close_to_axis(half, axis) if revolving else mirror_half(half, axis)
         what = "Revolve" if revolving else "Mirrored half"
 
@@ -275,15 +297,15 @@ def _read(pad_free, pad_half, session: Session, mode: str, style: str,
         if profile is None:
             shot = render_half(raw, segments, None, revolving)
             return None, (joined_note + "That half did not close into a region. "
-                          "Start and finish near the centreline."), shot, None
+                          "Start and finish near the centreline."), shot, {"revolving": revolving}
 
         kinds = [s.kind.value for s in segments]
         shape_note = (f", fitted as {len(segments)} piece(s): {', '.join(kinds)}"
                       if kinds else "")
         note = (joined_note + f"{what} profile, {profile_area(profile):.0f} mm2, "
                 f"{_size_note(profile)}{shape_note}")
-        note += _confidence_line("Looks like a", suggest_kind(half, axis))
-        return profile, note, render_half(raw, segments, half, revolving), half
+        note += f"\n\n{who} · {sug.reason}"
+        return [profile], note, render_half(raw, segments, half, revolving), {"revolving": revolving}
 
     if clicking:
         # Clicked corners describe the outline exactly, so there is nothing for
@@ -298,67 +320,91 @@ def _read(pad_free, pad_half, session: Session, mode: str, style: str,
                           "line, or the outline crosses itself."), None, None
         note = (f"Polygon from {len(ring) - 1} clicked corners, "
                 f"{profile_area(profile):.0f} mm2, {_size_note(profile)}")
-        return profile, note, render_clicks(stitched.points, True, False), None
+        profiles, sym_note = _symmetry([profile], make_sym)
+        return (profiles, note + sym_note,
+                render_sketch(session.doc.features, profiles, [px_to_mm(stitched.points)]), {})
 
-    prims = RECOGNIZER.recognize_batch(
-        [Stroke(points=smooth_seams(stitched))] if stitched.n_strokes > 1
-        else [Stroke(points=np.asarray(s, dtype=np.float64)) for s in strokes])
-    candidates = []
-    for p in prims:
-        prof = profile_from_primitive(p)
+    # SEVERAL SHAPES AT ONCE. Each group of strokes that closes on itself is
+    # its own outline; outlines inside outlines become holes. A plate drawn with
+    # two holes in it used to come back as just one of the three.
+    groups = stitch_all([np.asarray(s, dtype=np.float64) for s in strokes])
+    found, raws = [], []
+    for g in groups:
+        pts = smooth_seams(g) if g.n_strokes > 1 else g.points
+        prim = RECOGNIZER.recognize(Stroke(points=np.asarray(pts, dtype=np.float64)))
+        raws.append(prepare(Stroke(points=np.asarray(pts, dtype=np.float64))))
+        prof = profile_from_primitive(prim)
         if prof is not None:
-            candidates.append((p, prof, profile_area(prof)))
+            found.append((prim, prof))
 
-    if not candidates:
-        kinds = ", ".join(sorted({p.kind.value for p in prims}))
-        shot = render_recognition(prepare(Stroke(points=strokes[0])), prims[0]) if prims else None
-        return None, (joined_note + f"Found {len(prims)} shape(s) ({kinds}) but none "
-                      f"encloses an area. Join the ends up."), shot, None
+    if not found:
+        kinds = ", ".join(sorted({p.kind.value for p in RECOGNIZER.recognize_batch(
+            [Stroke(points=np.asarray(s, dtype=np.float64)) for s in strokes])}))
+        return None, (f"Found {len(groups)} shape(s) ({kinds}) but none encloses an "
+                      f"area. Join the ends up."), render_sketch(session.doc.features, (), raws), {}
 
-    prim, profile, area = max(candidates, key=lambda t: t[2])
-    note = (joined_note + f"Recognised **{prim.kind.value}** "
-            f"({prim.confidence:.0%} confident), {area:.0f} mm2, "
-            f"{_size_note(profile)}")
-    if len(candidates) > 1:
-        note += f" — used the largest of {len(candidates)} closed shapes"
-    if prim.confidence < LOW_CONFIDENCE:
-        note += "\n\n⚠ low confidence — redraw more clearly if this is not what you meant"
+    profiles = nest_profiles([p for _, p in found])
+    n_holes = sum(len(p.holes) for p in profiles)
+    names = ", ".join(f"**{pr.kind.value}** ({pr.confidence:.0%})" for pr, _ in found)
+    note = f"Recognised {names}"
+    if len(found) > 1:
+        note += (f" → {len(profiles)} solid(s)" + (f" with {n_holes} hole(s)" if n_holes else ""))
+    note += "  ·  " + "; ".join(f"{profile_area(p):.0f} mm2, {_size_note(p)}" for p in profiles)
+    if any(pr.confidence < LOW_CONFIDENCE for pr, _ in found):
+        note += "\n\n⚠ low confidence on at least one shape — redraw it more clearly if it is wrong"
+    profiles, sym_note = _symmetry(profiles, make_sym)
+    return profiles, note + sym_note, render_sketch(session.doc.features, profiles, raws), {}
 
-    raw = next((prepare(Stroke(points=np.asarray(st, dtype=np.float64)))
-                for st, pr in zip(strokes, prims) if pr is prim), None)
-    return profile, note, render_recognition(raw, prim), None
+
+def _symmetry(profiles, make_sym: bool):
+    """Report how symmetric each shape is, and make it exact if asked."""
+    out, notes = [], []
+    for p in profiles:
+        try:
+            s = find_symmetry(p)
+        except Exception:                            # noqa: BLE001
+            out.append(p); continue
+        if s.score > 0.999:
+            out.append(p); continue                  # already exact (a snapped circle / rect)
+        if make_sym and s.is_symmetric:
+            try:
+                out.append(symmetrize(p, s)); notes.append(f"made symmetric ({s.score:.0%} → 100%)")
+                continue
+            except Exception:                        # noqa: BLE001
+                pass
+        out.append(p)
+        if s.is_symmetric:
+            notes.append(f"looks {s.score:.0%} symmetric — tick **Make symmetric** to straighten it")
+        elif make_sym:
+            notes.append(f"only {s.score:.0%} symmetric, left as drawn")
+    return out, ("\n\n◇ " + "; ".join(notes)) if notes else ""
 
 
 # --------------------------------------------------------------------------- #
 # callbacks
 # --------------------------------------------------------------------------- #
 def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
-            mode: str, style: str, build_as: str):
+            mode: str, style: str, build_as: str, make_sym: bool = False):
     key = _canvas_key(mode, style)
-    profile, note, shot, _half = _read(pad_free, pad_half, session, mode, style,
-                                       build_as)
-    if profile is None:
+    profiles, note, shot, extra = _read(pad_free, pad_half, session, mode, style,
+                                        build_as, make_sym)
+    if not profiles:
         prev, rows, _ = _panels(session)
         return prev, rows, note, shot, gr.update(), session
 
-    session.submit_profile(profile)
-    session.choose_op(op)
-
-    revolving = mode == HALF_MODE and build_as == REVOLVE_AS
+    revolving = mode == HALF_MODE and (extra or {}).get("revolving", build_as == REVOLVE_AS)
     kwargs = ({"kind": FeatureKind.REVOLVE, "axis": centerline_axis()}
               if revolving else {})
     try:
-        feat = session.commit(depth=float(depth), z_base=float(z_base), **kwargs)
+        made = session.commit_many(profiles, op, depth=float(depth),
+                                   z_base=float(z_base), **kwargs)
     except Exception as exc:                        # noqa: BLE001 - shown to the user
         session.pending_profile = session.pending_op = None
         session.step = "draw"
         prev, rows, _ = _panels(session)
         return prev, rows, str(exc), shot, gr.update(), session
 
-    # If the new feature makes the document unbuildable, take it back out again.
-    # Leaving it in is technically consistent - the feature list IS the model -
-    # but it strands the user: every later rebuild fails too, and the only way
-    # out is an Undo they have no reason to think of.
+    # If the new features make the document unbuildable, take them back out.
     mesh, err = session.solid()
     if mesh is None:
         session.undo()
@@ -366,10 +412,7 @@ def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
         return (prev, rows, f"{err}\n\n*Not added - your drawing is untouched.*",
                 shot, gr.update(), session)
 
-    # Retire the ink INSTEAD of wiping the canvas. This is the whole trick: the
-    # drawing stays where the user put it, and the next read sees only what is
-    # new. `session.commit` has already snapshotted the old map, so Undo puts
-    # these strokes back in play.
+    # Retire the ink INSTEAD of wiping the canvas (see the module docstring).
     clicks = gr.update()
     if style == CLICK:
         session.clicked[key] = []
@@ -378,9 +421,11 @@ def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
         session.retire_ink(key, ink_mask(pad_half if mode == HALF_MODE else pad_free))
 
     how = ("revolved around the centreline" if revolving
-           else f"{feat.depth:g} mm deep from z={feat.z_base:g}")
-    preview, rows, msg = _panels(
-        session, f"{note}\n\nAdded as **{feat.name}** — {op.value}, {how}")
+           else f"{float(depth):g} mm deep from z={float(z_base):g}")
+    names = ", ".join(f"**{f.name}**" for f in made)
+    preview, rows, msg = _panels(session, f"{note}\n\nAdded {names} — {op.value}, {how}")
+    if mode != HALF_MODE:
+        shot = render_sketch(session.doc.features)   # the clean sketch, now including it
     kept = ("*Draw the next shape - the one you just built stays on the canvas "
             "so you can place it.*" if style != CLICK else
             "*Click the corners of the next shape.*")
@@ -389,34 +434,34 @@ def _commit(pad_free, pad_half, depth, z_base, op: Op, session: Session,
 
 @preview_cb
 def on_preview(pad_free, pad_half, state, mode=FREE_MODE, style=FREEHAND,
-               build_as=EXTRUDE_AS):
+               build_as=EXTRUDE_AS, make_sym=False):
     """Recognise without committing, so the user can check before building.
 
     This is also where the add-or-cut guess lives. It is only a guess: it says
     how sure it is and it changes nothing until a button is pressed.
     """
     session = _session(state)
-    profile, note, shot, _half = _read(pad_free, pad_half, session, mode, style,
-                                       build_as)
-    if profile is not None:
+    profiles, note, shot, _extra = _read(pad_free, pad_half, session, mode, style,
+                                         build_as, make_sym)
+    if profiles:
         existing = [f.profile for f in session.doc.features]
-        note += _confidence_line("Probably want to", suggest_op(profile, existing))
+        note += _confidence_line("Probably want to", suggest_op(profiles[0], existing))
     _, rows, _ = _panels(session)
     return rows, note, shot, session
 
 
 @build_cb
 def on_add(pad_free, pad_half, depth, z_base, state, mode=FREE_MODE,
-           style=FREEHAND, build_as=EXTRUDE_AS):
+           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False):
     return _commit(pad_free, pad_half, depth, z_base, Op.ADD, _session(state),
-                   mode, style, build_as)
+                   mode, style, build_as, make_sym)
 
 
 @build_cb
 def on_cut(pad_free, pad_half, depth, z_base, state, mode=FREE_MODE,
-           style=FREEHAND, build_as=EXTRUDE_AS):
+           style=FREEHAND, build_as=EXTRUDE_AS, make_sym=False):
     return _commit(pad_free, pad_half, depth, z_base, Op.CUT, _session(state),
-                   mode, style, build_as)
+                   mode, style, build_as, make_sym)
 
 
 @build_cb
@@ -523,56 +568,217 @@ def on_export(state):
 
 
 # --------------------------------------------------------------------------- #
+# the layer panel (Figma-style: pick a layer, edit it on the right)
+# --------------------------------------------------------------------------- #
+layer_cb = never_fails(7, 2)     # [preview, layers, status, sketch, selected, name, session]
+
+
+def _layer_outputs(session: Session, msg: str, selected: str | None):
+    prev, rows, status = _panels(session, msg)
+    ids = [f.feature_id for f in session.doc.features]
+    sel = selected if selected in ids else None
+    return (prev, rows, status, render_sketch(session.doc.features, selected=sel),
+            sel, session)
+
+
+def layer_list_update(state, selected=None):
+    """The Figma-style list: newest on top, the selected one highlighted."""
+    session = _session(state)
+    ch = choices(session.doc)
+    ids = [v for _, v in ch]
+    return gr.update(choices=ch, value=selected if selected in ids else None)
+
+
+def on_layer_select(state, evt: gr.SelectData):
+    """Click a layer in the list -> select it and load it into the Design panel."""
+    session = _session(state)
+    ch = choices(session.doc)
+    ids = [v for _, v in ch]
+    by_label = {lab: v for lab, v in ch}
+    val = evt.value
+    fid = val if val in ids else by_label.get(val)
+    idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if fid is None and isinstance(idx, int) and 0 <= idx < len(ids):
+        fid = ids[idx]
+    return (fid, *on_layer_pick(fid, session))
+
+
+def _selected_note(feature_id, state):
+    f = next((f for f in _session(state).doc.features if f.feature_id == feature_id), None)
+    if f:
+        return f"<span class='s3-sub'>Selected: <b>{f.name}</b> - edit it in Design → Selected layer</span>"
+    n = len(_session(state).doc.features)
+    return ("<span class='s3-sub'>Click a layer to select it.</span>" if n
+            else "<span class='s3-sub'>No layers yet - draw a shape.</span>")
+
+
+def on_layer_pick(feature_id, state):
+    """Selecting a layer fills the properties panel and highlights it in the sketch."""
+    session = _session(state)
+    f = next((f for f in session.doc.features if f.feature_id == feature_id), None)
+    if f is None:
+        return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                render_sketch(session.doc.features))
+    return (f.name, "Cut" if f.op is Op.CUT else "Add", float(f.depth), float(f.z_base),
+            bool(f.visible), render_sketch(session.doc.features, selected=feature_id))
+
+
+@layer_cb
+def on_layer_apply(feature_id, name, op, depth, z_base, visible, state):
+    session = _session(state)
+    if not feature_id:
+        return (*_layer_outputs(session, "Pick a layer first.", None)[:5], gr.update(), session)
+    before = list(session.doc.features)
+    session.edit_feature(feature_id, name=(name or "").strip() or "Layer",
+                         op=Op.CUT if op == "Cut" else Op.ADD,
+                         depth=max(float(depth), 0.01), z_base=float(z_base),
+                         visible=bool(visible))
+    mesh, err = session.solid()
+    if mesh is None:                                  # an edit that breaks the part is refused
+        session.undo()
+        return (*_layer_outputs(session, f"{err}\n\n*Edit not applied.*", feature_id)[:5],
+                gr.update(), session)
+    out = _layer_outputs(session, "Layer updated.", feature_id)
+    return (*out[:5], gr.update(), session)
+
+
+@layer_cb
+def on_layer_move(feature_id, delta, state):
+    session = _session(state)
+    if not feature_id:
+        return (*_layer_outputs(session, "Pick a layer first.", None)[:5], gr.update(), session)
+    if not session.move_feature(feature_id, int(delta)):
+        return (*_layer_outputs(session, "Already at the end of the list.", feature_id)[:5],
+                gr.update(), session)
+    mesh, err = session.solid()
+    if mesh is None:
+        session.undo()
+        return (*_layer_outputs(session, f"{err}\n\n*Order not changed.*", feature_id)[:5],
+                gr.update(), session)
+    return (*_layer_outputs(session, "Order changed - layers build top to bottom of the table.",
+                            feature_id)[:5], gr.update(), session)
+
+
+@layer_cb
+def on_layer_delete(feature_id, state):
+    session = _session(state)
+    if not feature_id:
+        return (*_layer_outputs(session, "Pick a layer first.", None)[:5], gr.update(), session)
+    session.delete_feature(feature_id)
+    return (*_layer_outputs(session, "Layer deleted. Undo brings it back.", None)[:5],
+            gr.update(), session)
+
+
+# --------------------------------------------------------------------------- #
 # layout
 # --------------------------------------------------------------------------- #
 BRUSH = gr.Brush(default_size=BRUSH_PX, colors=["#000000"],
                  default_color="#000000", color_mode="fixed")
 SHEET_W, SHEET_H = CANVAS_W / PX_PER_MM, CANVAS_H / PX_PER_MM
 
+# Figma-like chrome: a thin top bar, LAYERS on the left, the canvas in the
+# middle, a DESIGN panel on the right. Pure styling - every component and every
+# event is the same as before, so none of this can bring back the loading hang.
+HEAD = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+        'family=Inter:wght@400;500;600&display=swap">')
+
+CSS = """
+:root, .gradio-container { --s3-bg:#f5f5f5; --s3-panel:#ffffff; --s3-line:#e6e6e6;
+  --s3-ink:#1e1e1e; --s3-mute:#8a8a8a; --s3-blue:#0d99ff; --s3-sel:#e5f4ff; }
+.gradio-container { background: var(--s3-bg) !important; max-width: 100% !important;
+  padding: 0 !important; font-family: Inter, ui-sans-serif, system-ui, sans-serif !important;
+  font-size: 12px !important; color: var(--s3-ink); }
+#s3-topbar { background:#2c2c2c; color:#fff; padding:8px 14px; margin:0 !important;
+  border-radius:0 !important; align-items:center; gap:14px; }
+#s3-topbar * { color:#fff; }
+#s3-topbar .s3-title { font-weight:600; font-size:13px; letter-spacing:.01em; }
+#s3-topbar .s3-badge { font-size:11px; opacity:.75; }
+#s3-topbar label, #s3-topbar .wrap { background:transparent !important; border:none !important; }
+#s3-topbar input[type=radio] + span, #s3-topbar label span { font-size:12px; }
+#s3-topbar fieldset { padding:0 !important; }
+#s3-topbar .block { background:transparent !important; border:none !important; box-shadow:none !important; }
+.s3-panel { background: var(--s3-panel) !important; border-right:1px solid var(--s3-line);
+  border-left:1px solid var(--s3-line); min-height: calc(100vh - 52px); padding:10px 12px !important; }
+.s3-panel .block, .s3-panel .form { border:none !important; box-shadow:none !important;
+  background:transparent !important; }
+.s3-h { font-weight:600; font-size:11px; color:var(--s3-ink); padding:6px 0 4px;
+  border-bottom:1px solid var(--s3-line); margin-bottom:6px; letter-spacing:.02em; }
+.s3-h span { color:var(--s3-mute); font-weight:400; }
+.s3-panel label > span, .s3-panel .label-wrap span { font-size:11px !important; color:var(--s3-mute) !important;
+  font-weight:400 !important; }
+.s3-panel input[type=text], .s3-panel input[type=number], .s3-panel textarea {
+  font-size:12px !important; border-radius:4px !important;
+  border:1px solid transparent !important; background:#f5f5f5 !important; }
+.s3-panel input[type=text]:focus, .s3-panel input[type=number]:focus {
+  border-color: var(--s3-blue) !important; background:#fff !important; }
+.s3-panel input[type=checkbox]:checked, .s3-panel input[type=radio]:checked {
+  background-color: var(--s3-blue) !important; border-color: var(--s3-blue) !important; }
+.s3-panel button { border-radius:6px !important; font-size:12px !important; font-weight:500 !important;
+  box-shadow:none !important; }
+.s3-panel button.primary { background: var(--s3-blue) !important; border-color: var(--s3-blue) !important; color:#fff !important; }
+.s3-panel button.secondary { background:#fff !important; border:1px solid var(--s3-line) !important; color:var(--s3-ink) !important; }
+.s3-panel button.stop { background:#fff !important; border:1px solid #f24822 !important; color:#f24822 !important; }
+#layer-list .wrap { display:flex !important; flex-direction:column !important; gap:0 !important; }
+#layer-list label { width:100% !important; margin:0 !important; padding:7px 8px !important;
+  border:none !important; border-radius:4px !important; background:transparent !important;
+  box-shadow:none !important; font-size:12px !important; cursor:pointer; }
+#layer-list label:hover { background:#f0f0f0 !important; }
+#layer-list label.selected, #layer-list label:has(input:checked) {
+  background: var(--s3-sel) !important; color: var(--s3-ink) !important;
+  box-shadow: inset 2px 0 0 var(--s3-blue) !important; }
+#layer-list input[type=radio] { position:absolute !important; opacity:0 !important;
+  width:1px !important; height:1px !important; }
+#layer-props { background:#fff !important; border:none !important; }
+#layer-props > div, #layer-props .block { background:#fff !important; }
+.s3-status, .s3-status p { font-size:12px !important; line-height:1.45 !important; }
+.s3-status strong { font-weight:600; }
+#s3-canvas { background: var(--s3-bg) !important; padding:12px !important; }
+#s3-canvas .block { border-radius:6px !important; border:1px solid var(--s3-line) !important; }
+.s3-status { font-size:12px; color:var(--s3-ink); }
+.s3-sub { color: var(--s3-mute); font-size:11px; }
+footer { display:none !important; }
+"""
+
 with gr.Blocks(title="Sketch3D") as demo:
     session = gr.State()          # filled by _session() on first use
+    picker = gr.State(None)       # the selected layer's feature_id
 
-    gr.Markdown(
-        f"""# Sketch3D
-Draw a closed shape on the left. **Add volume** makes it a solid; **Cut volume** removes it from
-what is already there. Repeat, then export an STL.
+    # ---------------------------------------------------------------- top bar
+    with gr.Row(elem_id="s3-topbar", equal_height=True):
+        gr.HTML(f"<span class='s3-title'>◆ Sketch3D</span>&nbsp;&nbsp;"
+                f"<span class='s3-badge'>ML1 · {ARM.split(' (')[0]}  |  ML2 · "
+                f"{'ResNet-18' if 'ResNet' in KIND_ARM else 'rules'}</span>")
+        mode = gr.Radio([FREE_MODE, HALF_MODE], value=FREE_MODE, show_label=False,
+                        container=False, scale=2)
+        style = gr.Radio([FREEHAND, CLICK], value=FREEHAND, show_label=False,
+                         container=False, scale=2)
 
-<sub>Shape recogniser: {ARM}<br>Add/cut suggestion: {OP_ARM}</sub>"""
-    )
+    with gr.Row(equal_height=False):
+        # ------------------------------------------------------------ LAYERS
+        with gr.Column(scale=2, min_width=220, elem_classes="s3-panel"):
+            gr.HTML("<div class='s3-h'>Layers <span>· click to select</span></div>")
+            # A Radio styled as Figma's layer list. It is only ever an OUTPUT and
+            # is read through .select (SelectData), never as an input, so Gradio
+            # never validates a value against choices it set at build time.
+            layer_list = gr.Radio(choices=[], show_label=False, container=False, interactive=True,
+                                  elem_id="layer-list")
+            selected_note = gr.Markdown("<span class='s3-sub'>No layers yet - draw a shape.</span>")
+            with gr.Row():
+                undo_btn = gr.Button("Undo", size="sm")
+                clear_btn = gr.Button("Start over", size="sm")
+            gr.HTML("<div class='s3-h' style='margin-top:14px'>3D preview</div>")
+            preview = gr.Model3D(height=260, label=None, show_label=False)
 
-    with gr.Row():
-        with gr.Column(scale=5):
-            gr.Markdown("### 1. Draw")
-            mode = gr.Radio(
-                [FREE_MODE, HALF_MODE], value=FREE_MODE, label="Drawing mode",
-                info="Half mode: draw ONE half of the outline against the "
-                     "centreline, the way you would in Fusion. Because the "
-                     "centreline is drawn rather than guessed, there is no axis "
-                     "to infer and no axis error to make.")
-            style = gr.Radio(
-                [FREEHAND, CLICK], value=FREEHAND, label="How to draw it",
-                info="Freehand is right for curves - the fitter turns a wobbly "
-                     "arc into a true one. Straight edges are easier clicked: "
-                     "each click drops a corner on the grid and the edges join "
-                     "up exactly, with no hand wobble to undo.")
-            build_as = gr.Radio(
-                [REVOLVE_AS, EXTRUDE_AS], value=REVOLVE_AS, visible=False,
-                label="What to do with the half",
-                info="Half an arch revolved is a ball; mirrored and extruded it "
-                     "is a block. The drawing is the same either way, so this "
-                     "is your call.")
-
+        # ------------------------------------------------------------ CANVAS
+        with gr.Column(scale=6, min_width=520, elem_id="s3-canvas"):
             # TWO canvases, one per mode, each with its background baked in at
             # construction. They are inputs only - nothing writes to them, not
             # even a visibility flag - so no click can put them in a loading
-            # state. Switching modes shows and hides the COLUMN around each one,
-            # which is why these wrappers exist.
+            # state. Switching modes shows and hides the COLUMN around each one.
             with gr.Column(visible=True) as free_box:
                 pad_free = gr.Sketchpad(
                     height=CANVAS_H, width=CANVAS_W, label=None, type="numpy",
                     canvas_size=(CANVAS_W, CANVAS_H), value=grid_background(False),
-                    # A fat brush blurs corners together and the skeletoniser
-                    # then rounds them off, so rectangles read as blobs.
                     brush=BRUSH)
             with gr.Column(visible=False) as half_box:
                 pad_half = gr.Sketchpad(
@@ -582,80 +788,89 @@ what is already there. Repeat, then export an STL.
             clicks = gr.Image(value=render_clicks([], False, False), label=None,
                               height=CANVAS_H, interactive=False, visible=False)
             with gr.Row(visible=False) as click_tools:
-                undo_pt_btn = gr.Button("Undo last corner")
-                clear_pt_btn = gr.Button("Clear corners")
-
+                undo_pt_btn = gr.Button("Undo last corner", size="sm")
+                clear_pt_btn = gr.Button("Clear corners", size="sm")
             gr.Markdown(
-                f"<sub>The sheet is {SHEET_W:.0f} x {SHEET_H:.0f} mm and the grid "
-                f"is 5 mm, so you can draw a 40 mm circle on purpose rather than "
-                f"finding out afterwards. A shape can take several strokes - they "
-                f"are joined automatically. <b>Your drawing is never cleared:</b> "
-                f"once a shape has been built the app stops looking at it, so just "
-                f"draw the next one beside it.</sub>"
-            )
+                f"<span class='s3-sub'>Sheet {SHEET_W:.0f} × {SHEET_H:.0f} mm, 5 mm grid. "
+                f"Draw several shapes at once - a shape inside another becomes a hole. "
+                f"Your ink is never cleared; built shapes are simply not read again.</span>")
+            recognised = gr.Image(label="Clean sketch  (grey = built, orange = selected, "
+                                        "blue = what it reads as)",
+                                  height=300, interactive=False)
 
-            recognised = gr.Image(label="What I recognised  (grey = your stroke, blue = the fitted shape)",
-                                  height=220, interactive=False)
-
-            gr.Markdown("### 2. Depth")
+        # ------------------------------------------------------------ DESIGN
+        with gr.Column(scale=3, min_width=280, elem_classes="s3-panel"):
+            gr.HTML("<div class='s3-h'>Build</div>")
+            build_as = gr.Radio(
+                [AUTO_AS, REVOLVE_AS, EXTRUDE_AS], value=AUTO_AS, visible=False,
+                label="Half becomes",
+                info="ML2 decides by default and says how sure it is - pick one to override.")
+            make_sym = gr.Checkbox(False, label="Make symmetric")
             with gr.Row():
-                depth = gr.Number(value=DEFAULT_DEPTH_MM, label="Depth (mm)", precision=2)
-                z_base = gr.Number(value=0.0, label="Start at z (mm)", precision=2)
-            gr.Markdown("<sub>Depth is ignored by a revolve - its height comes "
-                        "from how tall you drew the half, and where on the "
-                        "centreline you drew it is where it lands.</sub>")
-
-            gr.Markdown("### 3. Build")
+                depth = gr.Number(value=DEFAULT_DEPTH_MM, label="Depth (mm)", precision=2, min_width=90)
+                z_base = gr.Number(value=0.0, label="Start z (mm)", precision=2, min_width=90)
+            preview_btn = gr.Button("What did I draw?", size="sm")
             with gr.Row():
-                preview_btn = gr.Button("What did I draw?")
-                add_btn = gr.Button("Add volume", variant="primary")
-                cut_btn = gr.Button("Cut volume", variant="stop")
+                add_btn = gr.Button("Add volume", variant="primary", size="sm")
+                cut_btn = gr.Button("Cut volume", variant="stop", size="sm")
+            status = gr.Markdown("Draw a shape to begin.", elem_classes="s3-status")
+
+            gr.HTML("<div class='s3-h' style='margin-top:14px'>Selected layer</div>")
+            with gr.Group(elem_id="layer-props"):
+                lp_name = gr.Textbox(label="Name")
+                lp_op = gr.Radio(["Add", "Cut"], label="Operation")
+                with gr.Row():
+                    lp_depth = gr.Number(label="Depth (mm)", precision=2, min_width=90)
+                    lp_z = gr.Number(label="Start z (mm)", precision=2, min_width=90)
+                lp_vis = gr.Checkbox(True, label="Visible")
             with gr.Row():
-                undo_btn = gr.Button("Undo")
-                clear_btn = gr.Button("Start over")
-
-        with gr.Column(scale=5):
-            gr.Markdown("### 3D Preview")
-            preview = gr.Model3D(height=330, label=None)
-            status = gr.Markdown("Draw a shape to begin.")
-
-            gr.Markdown("### Features / Layers")
-            layers = gr.Dataframe(headers=HEADERS, label=None, interactive=False)
+                lp_apply = gr.Button("Apply", variant="primary", size="sm")
+                lp_del = gr.Button("Delete", variant="stop", size="sm")
             with gr.Row():
-                export_btn = gr.Button("Export STL", variant="primary")
-                stl_file = gr.File(label="STL")
+                lp_up = gr.Button("▲ earlier", size="sm")
+                lp_down = gr.Button("▼ later", size="sm")
 
-    with gr.Accordion("How it works", open=False):
-        gr.Markdown(
-            """
-Your pen marks are thresholded, thinned to one-pixel centrelines and traced back into ordered
-paths. Strokes that end near each other are joined into one contour, so a four-stroke rectangle
-is still a rectangle. Each contour is classified — line, arc, circle, rectangle, or an
-unrecognised polyline — and the matching primitive is fitted by least squares, so a wobbly
-circle becomes an exact one. Clicked corners skip all of that: they are already exact.
+            gr.HTML("<div class='s3-h' style='margin-top:14px'>Export</div>")
+            export_btn = gr.Button("Export STL", variant="primary", size="sm")
+            stl_file = gr.File(label="STL", show_label=False)
 
-The closed outline is then either extruded to your depth or revolved around the centreline you
-drew, and unioned or subtracted from the running solid with a mesh boolean. Export runs a
-watertightness and printability check first.
-
-Add-or-cut and revolve-or-extrude are *suggested* with a confidence and never decided for you.
-They are geometric rules today; the same suggestion object is where the learned model goes.
-
-The feature list on the right *is* the model: it is replayed from scratch on every edit, which
-is why undo is instant and the preview can never drift out of sync with the list.
-            """
-        )
+            with gr.Accordion("Build order (table)", open=False):
+                layers = gr.Dataframe(headers=HEADERS, label=None, interactive=False,
+                                      wrap=True, show_label=False)
+            with gr.Accordion("How it works", open=False):
+                gr.Markdown(
+                    """
+Pen marks are thinned to centrelines and traced into paths. Strokes whose ends meet are joined into
+one outline; several outlines are read at once, and one inside another becomes a hole. **ML1**
+(trained from scratch) names each outline - line, arc, circle, rectangle, polyline - and the exact
+shape is fitted. In half mode **ML2** (fine-tuned ResNet-18) decides revolve or mirror-extrude and
+says how sure it is; you can always override it. The layer list *is* the model: it is replayed on
+every edit, so editing an old layer, hiding it or reordering it just rebuilds.
+""")
 
     # The canvases are inputs to everything and outputs of nothing.
     pads = [pad_free, pad_half]
     outs = [preview, layers, status, recognised, clicks, session]
 
-    preview_btn.click(on_preview, pads + [session, mode, style, build_as],
+    preview_btn.click(on_preview, pads + [session, mode, style, build_as, make_sym],
                       [layers, status, recognised, session])
-    add_btn.click(on_add, pads + [depth, z_base, session, mode, style, build_as], outs)
-    cut_btn.click(on_cut, pads + [depth, z_base, session, mode, style, build_as], outs)
-    undo_btn.click(on_undo, [session, mode, style], outs)
-    clear_btn.click(on_clear, pads + [session, mode, style], outs)
+    relist = dict(fn=layer_list_update, inputs=[session, picker], outputs=[layer_list])
+    add_btn.click(on_add, pads + [depth, z_base, session, mode, style, build_as, make_sym],
+                  outs).then(**relist)
+    cut_btn.click(on_cut, pads + [depth, z_base, session, mode, style, build_as, make_sym],
+                  outs).then(**relist)
+    undo_btn.click(on_undo, [session, mode, style], outs).then(**relist)
+    clear_btn.click(on_clear, pads + [session, mode, style], outs).then(**relist)
+
+    layer_outs = [preview, layers, status, recognised, picker, lp_name, session]
+    layer_list.select(on_layer_select, [session],
+                      [picker, lp_name, lp_op, lp_depth, lp_z, lp_vis, recognised])
+    picker.change(_selected_note, [picker, session], [selected_note])
+    lp_apply.click(on_layer_apply, [picker, lp_name, lp_op, lp_depth, lp_z, lp_vis, session],
+                   layer_outs).then(**relist)
+    lp_del.click(on_layer_delete, [picker, session], layer_outs).then(**relist)
+    lp_up.click(on_layer_move, [picker, gr.State(-1), session], layer_outs).then(**relist)
+    lp_down.click(on_layer_move, [picker, gr.State(1), session], layer_outs).then(**relist)
 
     views = [free_box, half_box, clicks, click_tools, build_as]
     mode.change(on_view_change, [mode, style], views)
@@ -668,9 +883,13 @@ is why undo is instant and the preview can never drift out of sync with the list
     export_btn.click(on_export, [session], [stl_file, status])
 
 
-if __name__ == "__main__":
-    # `theme` belongs to launch() in Gradio 6; older versions take it on Blocks().
+def launch(**kwargs):
+    """Launch with the Figma-like styling. In Gradio 6 `css`/`theme` go to launch()."""
     try:
-        demo.launch(theme=gr.themes.Soft())
-    except TypeError:
-        demo.launch()
+        return demo.launch(css=CSS, theme=gr.themes.Base(), head=HEAD, **kwargs)
+    except TypeError:                                 # older Gradio: no css/theme here
+        return demo.launch(**kwargs)
+
+
+if __name__ == "__main__":
+    launch()

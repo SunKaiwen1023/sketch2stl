@@ -30,7 +30,7 @@ URL = f"http://127.0.0.1:{PORT}/"
 SERVER = f"""
 import sys; sys.path.insert(0, {str(ROOT)!r})
 import app as A
-A.demo.launch(server_name="127.0.0.1", server_port={PORT},
+A.launch(server_name="127.0.0.1", server_port={PORT},
               prevent_thread_lock=True, quiet=True)
 import time
 while True: time.sleep(3600)

@@ -270,6 +270,68 @@ def render_recognition(raw_mm, primitive, size=(CANVAS_W, CANVAS_H)):
     return np.asarray(img)
 
 
+def render_sketch(built, current=(), raw_mm=(), selected: str | None = None,
+                  size=(CANVAS_W, CANVAS_H)):
+    """The CLEAN sketch: every layer already built, plus what is being read now.
+
+    The canvas has to keep the user's own ink (writing to it hangs the
+    Sketchpad), so this is where the snapped version lives:
+
+      grey fill      layers already built (ADD), red outline for CUT layers,
+                     hidden layers dashed-light
+      orange         the layer selected in the layer panel
+      thin grey      the raw ink being read right now
+      blue           what it was recognised / cleaned up as - every shape, holes included
+
+    `built` is a list of Features (extrude ones are drawn; revolves live on the
+    half canvas). `current` is a list of Profiles.
+    """
+    from PIL import Image, ImageDraw
+
+    from sketch2stl.strokes import mm_to_px
+    from sketch2stl.types import FeatureKind, Op
+
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+    _draw_grid(d, size)
+
+    def ring(points):
+        return [tuple(p) for p in mm_to_px(np.asarray(points, dtype=np.float64))]
+
+    for f in built:
+        if getattr(f, "kind", FeatureKind.EXTRUDE) is not FeatureKind.EXTRUDE:
+            continue
+        outer = ring(f.profile.outer)
+        if len(outer) < 3:
+            continue
+        sel = selected is not None and f.feature_id == selected
+        if not f.visible:
+            d.line(outer + outer[:1], fill="#d9d9d9", width=1)
+            continue
+        if f.op is Op.CUT:
+            d.polygon(outer, fill="#ffffff")
+            d.line(outer + outer[:1], fill="#e8590c" if sel else "#d9480f", width=3 if sel else 2)
+        else:
+            d.polygon(outer, fill="#ffe8cc" if sel else "#e9ecef")
+            for h in f.profile.holes:
+                d.polygon(ring(h), fill="#ffffff")
+            d.line(outer + outer[:1], fill="#e8590c" if sel else "#868e96", width=3 if sel else 2)
+            for h in f.profile.holes:
+                hr = ring(h); d.line(hr + hr[:1], fill="#868e96", width=2)
+
+    for r in raw_mm or ():
+        if r is not None and len(r) > 1:
+            d.line(ring(r), fill="#c9c9c9", width=4, joint="curve")
+
+    for prof in current or ():
+        outer = ring(prof.outer)
+        d.line(outer + outer[:1], fill="#2a6fdb", width=3, joint="curve")
+        for h in prof.holes:
+            hr = ring(h); d.line(hr + hr[:1], fill="#2a6fdb", width=3, joint="curve")
+
+    return np.asarray(img)
+
+
 def render_half(raw_mm, segments, ring_mm, revolving: bool,
                 size=(CANVAS_W, CANVAS_H)):
     """The half-mode counterpart of `render_recognition`.
