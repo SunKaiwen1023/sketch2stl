@@ -284,3 +284,21 @@ def test_delete_and_move_layers():
     A.on_layer_delete(cut, s)
     assert [f.name for f in s.doc.features] == ["Add 1"]
     assert "Click a layer" in A.on_layer_delete(None, s)[2]
+
+
+def test_a_half_whose_arc_is_fitted_backwards_still_mirrors_to_the_full_outline():
+    """Bottom line out from the axis, then a curve back up to it. The arc came
+    back reversed and the half closed on itself, so Mirror gave a sliver."""
+    import math
+    ax = CANVAS_W / 2
+    pts = [(ax, CANVAS_H * .82)]
+    for i in range(41):
+        t = i / 40
+        pts.append((ax + CANVAS_W * (0.07 + 0.13 * math.sin(math.pi * min(1, t * 1.15)) + 0.04 * (1 - t)),
+                    CANVAS_H * (0.82 - 0.66 * t)))
+    pts.append((ax, CANVAS_H * .16))
+    p = pad(lambda d: d.line(pts, fill=(0, 0, 0, 255), width=3))
+    profs, *_ = A._read(BLANK, p, Session(), A.HALF_MODE, A.FREEHAND, A.EXTRUDE_AS)
+    xs = profs[0].outer[:, 0]
+    axis_mm = A.centerline_axis().point[0]
+    assert xs.min() < axis_mm - 20 and xs.max() > axis_mm + 20     # both sides of the centreline

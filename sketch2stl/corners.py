@@ -428,9 +428,23 @@ def polyline_from_segments(segments: list[Segment], closed: bool = False) -> np.
     """Chain fitted segments into one polyline for the kernel."""
     if not segments:
         return np.empty((0, 2))
-    out = [segments[0].points]
-    for s in segments[1:]:
-        out.append(s.points[1:] if len(s.points) > 1 else s.points)
+    # Each fitted piece is oriented to continue from where the last one ended.
+    # A fitted arc can come back reversed; chained as-is, a hand-drawn half
+    # (bottom line, then the curve up) turned into a closed loop on one side of
+    # the centreline, so "mirror" produced a sliver instead of the full outline.
+    pts = [np.asarray(s.points, dtype=np.float64) for s in segments]
+    if len(pts) > 1:
+        nxt = pts[1]
+        d_end = min(np.linalg.norm(pts[0][-1] - nxt[0]), np.linalg.norm(pts[0][-1] - nxt[-1]))
+        d_start = min(np.linalg.norm(pts[0][0] - nxt[0]), np.linalg.norm(pts[0][0] - nxt[-1]))
+        if d_start < d_end:
+            pts[0] = pts[0][::-1]
+    out = [pts[0]]
+    for q in pts[1:]:
+        end = out[-1][-1]
+        if np.linalg.norm(end - q[-1]) < np.linalg.norm(end - q[0]):
+            q = q[::-1]
+        out.append(q[1:] if len(q) > 1 else q)
     ring = np.vstack(out)
     if closed and np.linalg.norm(ring[0] - ring[-1]) > 1e-9:
         ring = np.vstack([ring, ring[:1]])
