@@ -637,11 +637,13 @@ def on_view_change(mode, style):
 def on_export(state):
     mesh, err = _session(state).solid()
     if mesh is None:
-        return None, err or "Nothing to export yet - add a shape first."
+        return gr.update(), err or "Nothing to export yet - add a shape first."
     path = Path(tempfile.gettempdir()) / "sketch3d_part.stl"
     problems = export_stl(mesh, path)
     msg = "Exported." if not problems else "Exported, but:\n- " + "\n- ".join(problems)
-    return str(path), msg
+    # The file box stays hidden until there is a file: empty, it was a tall
+    # drop zone that pushed the 3D preview off the screen.
+    return gr.update(value=str(path), visible=True), msg
 
 
 # --------------------------------------------------------------------------- #
@@ -808,6 +810,14 @@ HEAD = ('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
         "f();new MutationObserver(f).observe(document.documentElement,{attributes:true,subtree:true,"
         "attributeFilter:['class']});})();</script>")
 
+FULLSCREEN_JS = """() => {
+  const el = document.querySelector('#s3-preview');
+  if (!el) return;
+  if (document.fullscreenElement) { document.exitFullscreen(); }
+  else if (el.requestFullscreen) { el.requestFullscreen(); }
+  setTimeout(() => window.dispatchEvent(new Event('resize')), 150);
+}"""
+
 CSS = """
 :root, .gradio-container, .dark, .dark .gradio-container { color-scheme: light; --s3-bg:#f5f5f5; --s3-panel:#ffffff; --s3-line:#e6e6e6;
   --s3-ink:#1e1e1e; --s3-mute:#4d4d4d; --s3-blue:#0d99ff; --s3-sel:#e5f4ff; }
@@ -869,6 +879,42 @@ CSS = """
 .s3-status { font-size:12px; color:var(--s3-ink); }
 .s3-sub { color:#4d4d4d; font-size:11px; }
 footer { display:none !important; }
+
+/* ---- Figma-style tabs: plain text, active one dark and bold, no underline ---- */
+.s3-tabbar { display:flex; align-items:baseline; gap:12px; padding:2px 0 8px;
+  border-bottom:1px solid var(--s3-line); margin-bottom:8px; }
+.s3-tabbar .on { font-weight:600; font-size:12px; color:#1e1e1e; }
+.s3-tabbar .s3-hint { font-size:11px; color:#8a8a8a; }
+#s3-tabs { background:transparent !important; border:none !important; }
+#s3-tabs .tab-wrapper, #s3-tabs .tab-container { border:none !important; background:transparent !important;
+  box-shadow:none !important; border-bottom:1px solid var(--s3-line) !important; padding:0 0 2px !important;
+  height:auto !important; }
+#s3-tabs button[role=tab] { font-size:12px !important; font-weight:600 !important; color:#8a8a8a !important;
+  background:transparent !important; border:none !important; padding:6px 10px 8px 0 !important;
+  margin-right:6px !important; box-shadow:none !important; }
+#s3-tabs button[role=tab]:hover { color:#1e1e1e !important; }
+#s3-tabs button[role=tab].selected { color:#1e1e1e !important; }
+#s3-tabs button[role=tab]::after, #s3-tabs button[role=tab].selected::after,
+#s3-tabs .tab-container::after { display:none !important; }
+#s3-tabs .tabitem { border:none !important; padding:8px 0 0 !important; background:transparent !important; }
+
+/* ---- top bar: Figma toolbar - segmented, active item blue, no radio dots ---- */
+#s3-topbar fieldset > div, #s3-topbar .wrap { gap:2px !important; background:#1f1f1f !important;
+  padding:3px !important; border-radius:8px !important; width:fit-content; }
+#s3-topbar label { padding:5px 12px !important; border-radius:6px !important; cursor:pointer;
+  box-shadow:none !important; background:transparent !important; transition:background .12s; }
+#s3-topbar label:hover { background:#3a3a3a !important; }
+#s3-topbar label.selected, #s3-topbar label:has(input:checked) { background:#0d99ff !important; }
+#s3-topbar label input[type=radio] { display:none !important; }
+
+/* ---- 3D preview, and the same element in full screen ---- */
+#s3-preview { border-radius:6px !important; overflow:hidden; }
+.s3-hrow { align-items:flex-end !important; gap:6px !important; }
+#s3-fs { font-size:11px !important; padding:3px 8px !important; }
+#s3-stl { min-height:0 !important; }
+#s3-preview:fullscreen { background:#f5f5f5 !important; border-radius:0 !important; }
+#s3-preview:fullscreen > div, #s3-preview:fullscreen .wrap, #s3-preview:fullscreen canvas {
+  height:100vh !important; max-height:100vh !important; width:100vw !important; }
 """
 
 # Text colours set in the THEME, not only in CSS. Gradio's own greys (help text
@@ -906,7 +952,8 @@ with gr.Blocks(title="Sketch3D") as demo:
     with gr.Row(equal_height=False):
         # ------------------------------------------------------------ LAYERS
         with gr.Column(scale=2, min_width=220, elem_classes="s3-panel"):
-            gr.HTML("<div class='s3-h'>Layers <span>· newest on top · click one to edit</span></div>")
+            gr.HTML("<div class='s3-tabbar'><span class='on'>Layers</span>"
+                    "<span class='s3-hint'>newest on top · click to edit</span></div>")
             sel_id = gr.State()
             layer_table = gr.Dataframe(value=_layer_table(Session()), headers=LAYER_HEADERS,
                                        interactive=False, show_label=False, label=None,
@@ -931,9 +978,6 @@ with gr.Blocks(title="Sketch3D") as demo:
             with gr.Row():
                 up_btn = gr.Button("▲ Move up", size="sm")
                 down_btn = gr.Button("▼ Move down", size="sm")
-            gr.HTML("<div class='s3-h' style='margin-top:14px'>3D preview</div>")
-            preview = gr.Model3D(height=260, label=None, show_label=False,
-                                 clear_color=(0.96, 0.96, 0.96, 1.0), camera_position=(-60, 55, 210))
 
         # ------------------------------------------------------------ CANVAS
         with gr.Column(scale=6, min_width=520, elem_id="s3-canvas"):
@@ -965,6 +1009,8 @@ with gr.Blocks(title="Sketch3D") as demo:
 
         # ------------------------------------------------------------ DESIGN
         with gr.Column(scale=3, min_width=280, elem_classes="s3-panel"):
+          with gr.Tabs(elem_id="s3-tabs"):
+           with gr.Tab("Design"):
             gr.HTML("<div class='s3-h'>Build</div>")
             build_as = gr.Radio(
                 [AUTO_AS, REVOLVE_AS, EXTRUDE_AS], value=AUTO_AS, visible=False,
@@ -985,12 +1031,20 @@ with gr.Blocks(title="Sketch3D") as demo:
 
             gr.HTML("<div class='s3-h' style='margin-top:14px'>Export</div>")
             export_btn = gr.Button("Export STL", variant="primary", size="sm")
-            stl_file = gr.File(label="STL", show_label=False)
+            stl_file = gr.File(label="STL", show_label=False, visible=False, elem_id="s3-stl")
+
+            with gr.Row(elem_classes="s3-hrow"):
+                gr.HTML("<div class='s3-h' style='margin-top:14px'>3D preview "
+                        "<span>· drag to orbit</span></div>")
+                fs_btn = gr.Button("⛶ Full screen", size="sm", min_width=100, scale=0,
+                                   elem_id="s3-fs")
+            preview = gr.Model3D(height=300, label=None, show_label=False, elem_id="s3-preview",
+                                 clear_color=(0.96, 0.96, 0.96, 1.0), camera_position=(-60, 55, 210))
 
             # Kept (hidden) because every build callback returns the table rows.
             layers = gr.Dataframe(headers=HEADERS, label=None, interactive=False,
                                   show_label=False, visible=False)
-            with gr.Accordion("How it works", open=False):
+           with gr.Tab("About"):
                 gr.Markdown(
                     """
 Pen marks are thinned to centrelines and traced into paths. Strokes whose ends meet are joined into
@@ -1031,6 +1085,8 @@ every edit, so editing an old layer, hiding it or reordering it just rebuilds.
     clear_pt_btn.click(on_clear_points, [session, mode, style], [clicks, status, session])
 
     export_btn.click(on_export, [session], [stl_file, status])
+    # Full screen is pure browser work - no Python round trip, nothing to break.
+    fs_btn.click(None, None, None, js=FULLSCREEN_JS)
 
 
 def launch(**kwargs):
