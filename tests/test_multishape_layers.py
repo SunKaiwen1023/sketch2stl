@@ -160,42 +160,42 @@ def test_ml2_model_is_used_when_present(monkeypatch):
     assert sug.source == "ml" and sug.value == "revolve" and abs(sug.confidence - 0.8) < 1e-6
 
 
-# --------------------------------------------------------------- layer panel
-def _two_layers():
+# --------------------------------------------------------------- layer list
+def test_layer_list_shows_what_was_built():
     s = Session()
     A.on_add(pad(lambda d: d.rectangle([100, 100, 500, 380], outline=(0, 0, 0, 255), width=3)),
              BLANK, 10.0, 0.0, s)
-    p2 = pad(lambda d: (d.rectangle([100, 100, 500, 380], outline=(0, 0, 0, 255), width=3),
-                        d.ellipse([260, 200, 340, 280], outline=(0, 0, 0, 255), width=3)))
-    A.on_cut(p2, BLANK, 20.0, 0.0, s)
-    return s
+    html = A._layer_html(s)
+    assert "Add 1" in html and "add" in html and "10 mm" in html
+    assert "Nothing built yet" in A._layer_html(Session())
 
 
-def test_layer_edit_changes_the_part_and_can_be_undone():
-    s = _two_layers()
-    assert [f.op for f in s.doc.features] == [Op.ADD, Op.CUT]
-    base = s.doc.features[0]
-    out = A.on_layer_apply(base.feature_id, "Base plate", "Add", 25.0, 0.0, True, s)
-    assert s.doc.features[0].depth == 25.0 and s.doc.features[0].name == "Base plate"
-    assert "updated" in out[2].lower()
+def test_session_layer_edits_are_single_undo_steps():
+    s = Session()
+    A.on_add(pad(lambda d: d.rectangle([100, 100, 500, 380], outline=(0, 0, 0, 255), width=3)),
+             BLANK, 10.0, 0.0, s)
+    fid = s.doc.features[0].feature_id
+    s.edit_feature(fid, depth=25.0)
+    assert s.doc.features[0].depth == 25.0
     s.undo()
     assert s.doc.features[0].depth == 10.0
 
 
-def test_layer_hide_delete_and_reorder():
-    s = _two_layers()
-    cut = s.doc.features[1]
-    A.on_layer_apply(cut.feature_id, cut.name, "Cut", cut.depth, 0.0, False, s)
-    assert s.doc.features[1].visible is False
-    A.on_layer_move(cut.feature_id, -1, s)
-    assert s.doc.features[0].feature_id == cut.feature_id
-    A.on_layer_delete(cut.feature_id, s)
-    assert len(s.doc.features) == 1
+def test_hybrid_takes_the_circle_fit_when_ml_says_polyline():
+    from sketch2stl.recognizer.hybrid import HybridRecognizer
+    from sketch2stl.types import Primitive, PrimitiveKind, Stroke
 
-
-def test_layer_pick_fills_the_properties():
-    s = _two_layers()
-    f = s.doc.features[0]
-    name, op, depth, z, vis, img = A.on_layer_pick(f.feature_id, s)
-    assert (name, op, depth, vis) == (f.name, "Add", 10.0, True)
-    assert img.shape == (CANVAS_H, CANVAS_W, 3)
+    class Always:
+        def __init__(self, kind): self.kind = kind
+        def recognize(self, stroke):
+            return Primitive(kind=self.kind, params={}, points=np.zeros((4, 2)), confidence=0.9)
+    ring = np.c_[320 + 80 * np.cos(np.linspace(0, 2 * np.pi, 80)),
+                 240 + 80 * np.sin(np.linspace(0, 2 * np.pi, 80))]
+    h = HybridRecognizer(Always(PrimitiveKind.POLYLINE), Always(PrimitiveKind.CIRCLE))
+    assert h.recognize(Stroke(points=ring)).kind is PrimitiveKind.CIRCLE
+    quad = np.vstack([np.linspace(a, b, 20) for a, b in
+                      [((200, 150), (420, 160)), ((420, 160), (400, 330)),
+                       ((400, 330), (210, 320)), ((210, 320), (200, 150))]])
+    assert h.recognize(Stroke(points=quad)).kind is PrimitiveKind.POLYLINE   # 4 corners: not a circle
+    h = HybridRecognizer(Always(PrimitiveKind.ARC), Always(PrimitiveKind.CIRCLE))
+    assert h.recognize(Stroke(points=np.zeros((10, 2)))).kind is PrimitiveKind.ARC
